@@ -1,0 +1,9 @@
+# Exact versions, tested together. Do not change unless something breaks.
+requests==2.34.2
+urllib3==2.8.0
+idna==3.20
+certifi==2026.10.23
+charset-normalizer==3.5.2
+Pillow==13.0.0
+# Only needed on Render (the web server). Skipped automatically on Windows.
+gunicorn==26.2.0; platform_system != "Windows"

@@ -1,0 +1,7 @@
+# Never upload your real keys to GitHub.
+processed/
+telegram_state/
+answers_inbox/done/
+answers_inbox/needs_review/
+__pycache__/
+*.pyc
