@@ -28,6 +28,14 @@ Where keys live:
 2. Put it in TELEGRAM_BOT_TOKEN (Render) or telegram_bot_token (config.json).
 3. On Render, open the /setup/ link again afterwards (see DEPLOY_RENDER.md, Step 5), because a new token needs the webhook set again.
 
+## 1b. GS PYQs answers are not found ("GS PYQs tracker: NOT reachable")
+
+The bot searches both trackers. If /status says "GS PYQs tracker: NOT reachable, add the connection", open the GS PYQs database in Notion, click the ... menu (top right), Connections, and add the same integration you use for Geography optional. Until then, Geography optional answers keep working as before.
+
+The GS database is built in. Only if you ever move it to a new database: on Render add GS_TRACKER_DATABASE_ID (the 32 characters in its link) under Environment. Setting it to off switches GS PYQs off.
+
+GS rows in the proof log and Remarks have no "Tracker question" link (those link columns only point to Geography optional). Instead the row names the paper in Section and has a line with the GS question's link.
+
 ## 2. Gemini says the daily limit is reached
 
 The free plan has a daily limit. It resets at midnight US Pacific time (about 1:30 PM India time). Meanwhile the tool still attaches your pages, adds an "Evaluation pending" line and writes "Evaluation pending" in Gemini Remark. That Gemini Remark text is the waiting list, so do not edit it by hand.
@@ -66,6 +74,7 @@ Google retires old models from time to time. The tool first tries the model in g
 The tool needs these exact column names. Rename the column back in Notion (click the column header, then rename).
 
 - Tracker "Geography optional": Question, Status, Word Limit, Original Section, Year, Gemini Marks, Gemini Remark. Status must still have the options Done and Knowledge gap.
+- Tracker "GS PYQs": Question, Status, Year, Paper, Topic, Marks, Word Limit, Gemini Marks, Gemini Remark, Date. Status must still have the options Done and Knowledge gap.
 - Proof log "Answers written": Question, No., Date sent, Section, Score, Out of, Attempt, Tracker question.
 - "Remarks": Name, Date, Section, Score, Question.
 

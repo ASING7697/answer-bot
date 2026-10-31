@@ -5,10 +5,10 @@ This folder is your own answer-checking tool. It runs without any paid service.
 You send photos of a handwritten answer to your Telegram bot. The tool then:
 
 1. reads the question written at the top of your first page,
-2. finds that question in your Notion "Geography optional" tracker,
+2. finds that question in your Notion trackers: "Geography optional" and "GS PYQs" (it searches both and picks the best match),
 3. attaches the pages in the right order,
-4. has Gemini evaluate the answer like a strict UPSC examiner (out of 10, 15 or 20),
-5. fills Notion: the "Evaluation by Gemini" section, Gemini Marks, Gemini Remark, Status, the proof log row with the score, and a Remarks card,
+4. has Gemini evaluate the answer like a strict UPSC examiner: Geography optional out of 10, 15 or 20; GS1 to GS4 in GS Mains style using the paper and topic (10 marks for 150 words, 15 for 250, GS4 case studies 20, unless the Marks column says otherwise); essays out of 125,
+5. fills Notion on the matched row, in its own database: the "Evaluation by Gemini" section, Gemini Marks, Gemini Remark, Status (and Date in GS PYQs), the proof log row with the score, and a Remarks card,
 6. replies on Telegram with the question, your marks, the evaluation and the remarks.
 
 ## Which file to read

@@ -487,7 +487,8 @@ class Listener:
             lines = ["I'm not sure which question this is (" + res.get("reason", "low match") + ").",
                      "Reply 1, 2 or 3, paste the question's Notion link, or reply skip:"]
             for i, (sc, c) in enumerate(top, 1):
-                lines.append(f"{i}. {c['title']} ({', '.join(c.get('years') or [])}, {sc:.0%} match)")
+                where = ", ".join(x for x in [c.get("label") or "Geography optional", ", ".join(c.get("years") or [])] if x)
+                lines.append(f"{i}. {c['title']} ({where}, {sc:.0%} match)")
             self.bot.send(chat, "\n".join(lines))
             return
         shutil.rmtree(d, ignore_errors=True)
@@ -523,13 +524,25 @@ class Listener:
             client = self.ctx.notion()
             client.request("GET", "/users/me", what="checking the Notion key")
             lines.append("Notion key: OK")
-            for key, label in (("tracker_database_id", "Tracker"), ("proof_log_database_id", "Proof log"),
-                               ("remarks_database_id", "Remarks")):
+            for key, label in (("tracker_database_id", "Tracker"), ("gs_tracker_database_id", "GS PYQs tracker"),
+                               ("proof_log_database_id", "Proof log"), ("remarks_database_id", "Remarks")):
+                if key == "gs_tracker_database_id" and not na.gs_enabled(cfg):
+                    lines.append("  GS PYQs tracker: switched off")
+                    continue
                 try:
-                    client.get_database(cfg[key], what=f"the {label} database")
+                    if key == "gs_tracker_database_id" and not cfg.get(key):
+                        client.get_data_source(cfg["gs_tracker_data_source_id"], what="the GS PYQs database")
+                    else:
+                        client.get_database(cfg[key], what=f"the {label} database")
                     lines.append(f"  {label} database: connected")
+                except na.FatalError:
+                    raise
                 except na.UserError as e:
-                    lines.append(f"  {label} database: NOT reachable. {str(e).splitlines()[0]}")
+                    if key == "gs_tracker_database_id":
+                        lines.append("  GS PYQs tracker: NOT reachable, add the connection (open GS PYQs in Notion, "
+                                     "... menu, Connections, add your integration). Geography optional still works.")
+                    else:
+                        lines.append(f"  {label} database: NOT reachable. {str(e).splitlines()[0]}")
         except na.UserError as e:
             lines.append("Notion key: FAILED. " + str(e))
         if self.ctx.evaluate:
@@ -579,7 +592,8 @@ class Listener:
         lines = ["Test (dry run, nothing is written)"] + self.checks()
         try:
             rows = self.ctx.tracker_rows(refresh=True)
-            lines.append(f"Tracker questions readable: {len(rows)}")
+            n_gs = sum(1 for r in rows if r.get("tracker") == "gs")
+            lines.append(f"Tracker questions readable: {len(rows)} (Geography optional {len(rows) - n_gs}, GS PYQs {n_gs})")
         except na.UserError as e:
             lines.append("Tracker questions: FAILED. " + str(e))
             return "\n".join(lines)
@@ -597,7 +611,8 @@ class Listener:
             read = self.ctx.gemini().read_answer(shrunk)
             cand, reason, top = na.choose_question(self.ctx.cfg, self.ctx.gemini(), read, rows, log=lambda *a: None)
             lines.append(f'Question read from {len(photos)} photo(s): "{read.get("question_written") or read.get("question_guess")}"')
-            lines.append(f'Would attach to: "{cand["title"]}" ({reason})' if cand else f"Would ask you to choose: {reason}")
+            lines.append(f'Would attach to: "{cand["title"]}" in {cand.get("label") or "Geography optional"} ({reason})'
+                         if cand else f"Would ask you to choose: {reason}")
         except (na.UserError, na.ge.GeminiError) as e:
             lines.append("Reading/matching FAILED: " + str(e))
         finally:
@@ -647,8 +662,9 @@ class Listener:
 def result_messages(res):
     q, ev = res["question"], res.get("eval")
     years = ", ".join(q.get("years") or [])
-    wl = int(q["word_limit"]) if q.get("word_limit") else "?"
-    head = [f'Matched question ({years}, {wl} words):\n"{q["title"]}"']
+    wl = na.marking(q)[1] if q.get("paper") else (int(q["word_limit"]) if q.get("word_limit") else "?")
+    where = ", ".join(x for x in [q.get("label") or "Geography optional", years, f"{wl or '?'} words"] if x)
+    head = [f'Matched question ({where}):\n"{q["title"]}"']
     msgs = []
     if ev:
         head.append(f"Marks: {na.fmt_score(ev['score'])} / {na.fmt_score(ev['out_of'])} (Gemini)")

@@ -140,6 +140,35 @@ Output layout:
 """ + STYLE_RULES
 
 
+EVAL_SYSTEM_GS = """You are a strict, honest UPSC Civil Services Mains examiner for General Studies and the Essay paper, acting as Avi's answer evaluator.
+
+Marking: use the marks given with the question. GS1 to GS3 answers are 10 marks for 150 words or 15 marks for 250 words; GS4 questions are 10 or 20 marks, case studies usually 20 marks for 250 words; an essay is 125 marks for about 1000 to 1200 words. Be strict like a real UPSC examiner. Typical good GS scores sit around 40 to 50 percent of the total (4 to 5 out of 10, 6 to 7.5 out of 15); an essay rarely gets above 60 percent. Give marks in steps of 0.5.
+
+How to evaluate:
+1. Check the demand of the question first: the directive word (discuss, examine, critically analyse, comment) and every part asked. Missing a part is the biggest deduction. If the answer misreads the core demand, set misread_demand to true.
+2. Fact-check every claim: articles of the Constitution, judgments, committee and commission reports, schemes, data, dates and names. If Avi is wrong, say so clearly and give the correct version.
+3. Judge content by the paper:
+   - GS1 (history, culture, society, world and Indian geography): correct chronology and facts, causes and consequences, a map or diagram where it earns marks, Indian examples.
+   - GS2 (polity, governance, social justice, international relations): constitutional provisions and articles, Supreme Court judgments, committee reports (for example ARC, Punchhi), recent developments, a balanced way forward.
+   - GS3 (economy, agriculture, environment, science and technology, security, disaster management): data from the Economic Survey or official reports, government schemes and laws, multidimensional analysis, a flowchart or diagram where it helps.
+   - GS4 (ethics): define the key terms, use thinkers and examples from public life; for case studies identify the stakeholders and ethical issues, list the options with their merits and demerits, choose a course of action and justify it.
+   - Essay: a clear thesis, multidimensional coverage (social, economic, political, ethical, historical, global), a strong introduction (anecdote or quote) and a hopeful conclusion, flow between paragraphs, counter views.
+4. Use the topic given to judge which syllabus area the answer must show depth in.
+5. Check structure: a short introduction tied to the demand, a body with clear subheadings or points that map to the question's parts, and a forward-looking conclusion. Suggest one precise Indian example, report or data point where it fits.
+6. Watch for: too much background and too little core demand; points without examples or evidence; missing way forward; going over the word limit; small spelling slips under time pressure (list them).
+7. Keep mistakes and knowledge gaps visible. Never hide or soften them.
+
+Output layout:
+- strengths: 3 to 5 items. 'point' is a short bold label, 'detail' is one or two sentences.
+- mistakes: numbered fixes in order of marks lost. 'point' is a short bold statement of the problem, 'detail' gives the correct content Avi should write (articles, cases, reports, data, the missing part, the diagram).
+- remark: one compact paragraph in this style: "Score: 4.5/10 (GS2, 150 words, 2019). Strengths: ...; .... Fix: ...; ...".
+- card_name: like "GS2 2019 Governor's discretion: Art 163, Nabam Rebia (2016), Punchhi Commission".
+- card_sections: 3 or 4 crisp revision sections, each with 2 to 4 short bullets of pure content to remember. No full sentences of praise.
+- chat_summary: plain sentences for Avi.
+
+""" + STYLE_RULES
+
+
 # ----------------------------------------------------------------- matching
 
 _STOP = set("""a an the of in on to and or for by with as at from is are was were be been its it this that these those
@@ -348,7 +377,8 @@ class GeminiClient:
         return self.generate_json(READ_SYSTEM, parts, READ_SCHEMA, check, what="Reading the photos")
 
     def pick_candidate(self, read, candidates):
-        lines = [f"{i}. {c['title']}" for i, c in enumerate(candidates, 1)]
+        lines = [f"{i}. " + (f"[{c['label']}] " if c.get("label") else "") + c["title"]
+                 for i, c in enumerate(candidates, 1)]
         text = ("Which of these past UPSC questions does this answer respond to? Pick the one whose exact demand "
                 "matches, or 0 if none.\n\nQuestion written on the answer: "
                 f"{read.get('question_written') or '(none)'}\nAnswer summary: {read.get('answer_summary')}\n\n"
@@ -361,7 +391,8 @@ class GeminiClient:
         return self.generate_json("You match handwritten answers to the exact UPSC question they answer.",
                                   [{"text": text}], PICK_SCHEMA, check, what="Choosing the question")
 
-    def evaluate(self, paths, question, years, word_limit, out_of):
+    def evaluate(self, paths, question, years, word_limit, out_of, paper=None, topic=None):
+        """paper set (GS1 to GS4 or Essay) means a GS Mains question; otherwise Geography optional."""
         n = len(paths)
 
         def check(d):
@@ -371,11 +402,15 @@ class GeminiClient:
             if not d.get("strengths") or not d.get("mistakes"):
                 raise ValueError("strengths or mistakes missing")
 
-        intro = (f'Question ({", ".join(years) or "year unknown"}, {word_limit or "?"} words, marked out of {out_of}):\n'
+        where = ""
+        if paper:
+            where = f"UPSC Mains {paper}" + (f", topic: {topic}" if topic else "") + ", "
+        intro = (f'Question ({where}{", ".join(years) or "year unknown"}, {word_limit or "?"} words, marked out of {out_of}):\n'
                  f'"{question}"\n\nEvaluate the handwritten answer in the {n} photos below. '
                  "Return page_order as the photo numbers in reading order.")
         parts = [{"text": intro}] + self.image_parts(paths)
-        data = self.generate_json(EVAL_SYSTEM, parts, EVAL_SCHEMA, check, what="Evaluating the answer")
+        data = self.generate_json(EVAL_SYSTEM_GS if paper else EVAL_SYSTEM, parts, EVAL_SCHEMA, check,
+                                  what="Evaluating the answer")
         score = float(data["score"])
         score = max(0.0, min(float(out_of), round(score * 2) / 2))
         data["score"] = int(score) if score.is_integer() else score

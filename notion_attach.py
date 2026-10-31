@@ -59,6 +59,8 @@ DEFAULT_CONFIG = {
     "notion_token": "PASTE_YOUR_NOTION_SECRET_HERE",
     "tracker_database_id": "f051f0c54ccc8340ae6281b044b2e5da",
     "tracker_data_source_id": "e091f0c5-4ccc-8231-b554-070a930b6c20",
+    "gs_tracker_database_id": "bb075aa07c154ac9b79f44564db64d8c",
+    "gs_tracker_data_source_id": "808e70c4-24ed-4756-888c-89d66fe5aed3",
     "proof_log_database_id": "c46cec3441814d9194432652c73ec675",
     "proof_log_data_source_id": "7cdb751d-238a-4498-9fb7-137c980c6d34",
     "drive_folder": "G:\\My Drive\\UPSC_Answers",
@@ -169,6 +171,13 @@ def load_config(path=None):
         cfg["gemini_model"] = os.environ["GEMINI_MODEL"].strip()
     if os.environ.get("GEMINI_FALLBACK_MODELS"):
         cfg["gemini_fallback_models"] = [m.strip() for m in os.environ["GEMINI_FALLBACK_MODELS"].split(",") if m.strip()]
+    for env, key in (("GS_TRACKER_DATABASE_ID", "gs_tracker_database_id"),
+                     ("GS_TRACKER_DATA_SOURCE_ID", "gs_tracker_data_source_id")):
+        if env in os.environ:  # set it to "off" to switch the GS tracker off
+            val = os.environ[env].strip()
+            cfg[key] = "" if val.lower() in ("", "off", "none") else val
+            if key == "gs_tracker_database_id" and "GS_TRACKER_DATA_SOURCE_ID" not in os.environ:
+                cfg["gs_tracker_data_source_id"] = ""  # found from the database ID
     env_gem = os.environ.get("GEMINI_API_KEY")
     if env_gem:
         cfg["gemini_api_key"] = env_gem.strip()
@@ -513,9 +522,21 @@ def plan_tracker_insert(blocks, today_str):
 RESERVED_DIRS = {"done", "needs_review", "processed"}
 
 
+def tracker_of(page, cfg):
+    """'geo' for the Geography optional tracker, 'gs' for GS PYQs, None for any other page."""
+    parent = page.get("parent", {})
+    parent_ids = {plain_id(parent.get("data_source_id")), plain_id(parent.get("database_id"))} - {""}
+    for key, ds, db in (("geo", "tracker_data_source_id", "tracker_database_id"),
+                        ("gs", "gs_tracker_data_source_id", "gs_tracker_database_id")):
+        if ({plain_id(cfg.get(ds)), plain_id(cfg.get(db))} - {""}) & parent_ids:
+            return key
+    return None
+
+
 def read_question(page, cfg):
     props = page.get("properties", {})
     title, status, word_limit, section, years = "", None, None, None, []
+    paper = topic = marks = None
     for name, p in props.items():
         t = p.get("type")
         if t == "title":
@@ -528,12 +549,24 @@ def read_question(page, cfg):
             section = (p.get("select") or {}).get("name")
         elif name == "Year" and t == "multi_select":
             years = [o.get("name") for o in p.get("multi_select") or []]
-    parent = page.get("parent", {})
-    parent_ids = {plain_id(parent.get("data_source_id")), plain_id(parent.get("database_id"))}
-    in_tracker = bool({plain_id(cfg["tracker_data_source_id"]), plain_id(cfg["tracker_database_id"])} & parent_ids)
+        elif name == "Year" and t == "number" and p.get("number") is not None:
+            years = [fmt_score(p["number"])]
+        elif name == "Paper" and t == "select":
+            paper = (p.get("select") or {}).get("name")
+        elif name == "Topic" and t == "select":
+            topic = (p.get("select") or {}).get("name")
+        elif name == "Marks" and t == "number":
+            marks = p.get("number")
+    tracker = tracker_of(page, cfg)
+    if tracker == "gs":
+        label = "GS PYQs" + (f", {paper}" if paper else "")
+    else:
+        label = "Geography optional"
     return {"id": page.get("id"), "url": page.get("url"), "title": title, "status": status,
             "word_limit": word_limit, "section": section,
-            "years": sorted(y for y in years if y), "in_tracker": in_tracker}
+            "years": sorted(y for y in years if y), "in_tracker": tracker is not None,
+            "tracker": tracker or "geo", "paper": paper if tracker == "gs" else None, "topic": topic,
+            "marks": marks, "label": label, "edited": page.get("last_edited_time") or ""}
 
 
 def resolve_data_source(client, cfg, key_ds, key_db, label):
@@ -548,10 +581,39 @@ def resolve_data_source(client, cfg, key_ds, key_db, label):
 
 
 def out_of_for(q):
+    if q.get("paper"):
+        return marking(q)[0]
     try:
         return OUT_OF_MAP.get(int(q["word_limit"]))
     except (TypeError, ValueError):
         return None
+
+
+def _num(x):
+    try:
+        return int(float(x)) if x not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+
+def marking(q):
+    """(out_of, word_limit) for a question. GS Mains: Marks column if filled, else 10 marks/150 words,
+    15/250 when the word limit is 250, GS4 case studies 20/250, Essay 125 marks/1000 to 1200 words."""
+    paper = (q.get("paper") or "").strip()
+    wl, marks = _num(q.get("word_limit")), _num(q.get("marks"))
+    if not paper:
+        return OUT_OF_MAP.get(wl) or 15, wl
+    if paper.lower() == "essay":
+        return 125, wl or 1200
+    if marks:
+        return marks, wl or {10: 150, 15: 250, 20: 250}.get(marks, 250 if marks > 10 else 150)
+    title = (q.get("title") or "").lower()
+    if paper == "GS4" and (wl == 250 or "case" in title[:300] or len(title) > 400
+                           or re.search(r"\byou (are|have|were)\b", title)):
+        return 20, 250
+    if wl and wl >= 250:
+        return 15, 250
+    return 10, wl or 150
 
 
 def fmt_score(x):
@@ -582,6 +644,9 @@ def choose_question(cfg, gem, read, candidates, log=print):
         log(f"    {i}. ({sc:.0%}) {c['title'][:110]}")
     if best >= strong and best - second >= clear:
         return top[0][1], f"clear match ({best:.0%})", top
+    near = float(cfg.get("match_near_exact_score", 0.93))
+    if best >= near and best - second >= float(cfg.get("match_near_exact_margin", 0.03)):
+        return top[0][1], f"near-exact match ({best:.0%})", top
     help_mode = str(cfg.get("gemini_help_matching", "auto")).lower()
     if gem is not None and help_mode in ("auto", "always", "true", "yes"):
         try:
@@ -608,11 +673,23 @@ def choose_question(cfg, gem, read, candidates, log=print):
 
 # ----------------------------------------------------------------- Notion writing
 
-def ensure_gemini_columns(client, cfg, log=print):
+TRACKER_KEYS = {"geo": ("tracker_data_source_id", "tracker_database_id", "tracker"),
+                "gs": ("gs_tracker_data_source_id", "gs_tracker_database_id", "GS PYQs")}
+
+
+def tracker_ds(client, cfg, tracker="geo"):
+    return resolve_data_source(client, cfg, *TRACKER_KEYS[tracker])
+
+
+def gs_enabled(cfg):
+    return bool(cfg.get("gs_tracker_database_id") or cfg.get("gs_tracker_data_source_id"))
+
+
+def ensure_gemini_columns(client, cfg, log=print, tracker="geo"):
     """Create 'Gemini Marks' (number) and 'Gemini Remark' (text) on the tracker if missing.
-    Returns the set of column names that are safe to write."""
-    ds = resolve_data_source(client, cfg, "tracker_data_source_id", "tracker_database_id", "tracker")
-    schema = client.get_data_source(ds, what="the tracker's columns").get("properties", {})
+    Returns the set of column names that are safe to write (plus 'Date' if the tracker has a date column)."""
+    ds = tracker_ds(client, cfg, tracker)
+    schema = client.get_data_source(ds, what=f"the {TRACKER_KEYS[tracker][2]}'s columns").get("properties", {})
     want = {cfg.get("gemini_marks_property", "Gemini Marks"): "number",
             cfg.get("gemini_remark_property", "Gemini Remark"): "rich_text"}
     ok, missing = set(), {}
@@ -628,6 +705,8 @@ def ensure_gemini_columns(client, cfg, log=print):
         client.add_properties(ds, missing, what="creating the Gemini columns")
         log(f"  Created tracker column(s): {', '.join(missing)}")
         ok |= set(missing)
+    if (schema.get("Date") or {}).get("type") == "date":
+        ok.add("Date")
     return ok
 
 
@@ -650,13 +729,21 @@ def pending_block(today_str, why):
                        "(or send /retry to the bot).", False)])
 
 
+def proof_log_question_filter(q, page_id):
+    """The proof log's 'Tracker question' relation points to the Geography tracker, so GS rows are found by title."""
+    if q.get("tracker") == "gs":
+        return {"property": "Question", "title": {"equals": (q.get("title") or "")[:1900]}}
+    return {"property": "Tracker question", "relation": {"contains": page_id}}
+
+
 def proof_log_update(client, cfg, page_id, q, upload_ids, attempt, today, score=None, captions=None):
     ds = resolve_data_source(client, cfg, "proof_log_data_source_id", "proof_log_database_id", "proof log")
     today_s = today.isoformat()
     out_of = out_of_for(q)
+    gs = q.get("tracker") == "gs"
     found = client.query_data_source(ds, {
         "filter": {"and": [
-            {"property": "Tracker question", "relation": {"contains": page_id}},
+            proof_log_question_filter(q, page_id),
             {"property": "Date sent", "date": {"equals": today_s}},
         ]}, "page_size": 5}, what="looking for today's proof log row").get("results", [])
     captions = captions or [None] * len(upload_ids)
@@ -683,22 +770,23 @@ def proof_log_update(client, cfg, page_id, q, upload_ids, attempt, today, score=
     if latest:
         last_no = (latest[0].get("properties", {}).get("No.") or {}).get("number") or 0
     no = int(last_no) + 1
-    wl = int(q["word_limit"]) if q["word_limit"] else None
+    wl = marking(q)[1] if gs else (int(q["word_limit"]) if q["word_limit"] else None)
     props = {
         "Question": {"title": rich([(q["title"], False)])},
         "No.": {"number": no},
         "Date sent": {"date": {"start": today_s}},
         "Attempt": {"select": {"name": attempt}},
-        "Tracker question": {"relation": [{"id": page_id}]},
     }
+    if not gs:
+        props["Tracker question"] = {"relation": [{"id": page_id}]}
     if out_of:
         props["Out of"] = {"number": out_of}
     if score is not None:
         props["Score"] = {"number": score}
-    sec = SECTION_MAP.get(q["section"] or "")
+    sec = (q.get("paper") or "GS") if gs else SECTION_MAP.get(q["section"] or "")
     if sec:
         props["Section"] = {"select": {"name": sec}}
-    label = ", ".join(x for x in [", ".join(q["years"]), f"{wl} words" if wl else ""] if x)
+    label = ", ".join(x for x in [q["label"] if gs else "", ", ".join(q["years"]), f"{wl} words" if wl else ""] if x)
     score_line = (f"Score: {fmt_score(score)} / {out_of or '?'}" if score is not None
                   else f"Score: pending / {out_of or '?'}")
     children = [
@@ -706,9 +794,25 @@ def proof_log_update(client, cfg, page_id, q, upload_ids, attempt, today, score=
         paragraph([(score_line, True), (f" ({attempt.lower()} attempt, evaluated by Gemini)"
                                         if score is not None else f" ({attempt.lower()} attempt)", False)]),
     ] + images
-    page = client.create_page({"parent": {"type": "data_source_id", "data_source_id": ds},
-                               "properties": props, "children": children})
+    if gs:
+        children.insert(1, paragraph([("Tracker: ", True), (f"{q['label']} ({q.get('url') or page_id})", False)]))
+    page = create_with_section_fallback(client, {"parent": {"type": "data_source_id", "data_source_id": ds},
+                                                 "properties": props, "children": children}, "creating the proof log row")
     return {"action": "created", "url": page.get("url"), "no": no}
+
+
+def create_with_section_fallback(client, body, what):
+    """Creates a page; if Notion refuses the Section option (for example GS2 is not an option and cannot be
+    added), tries once more without Section."""
+    try:
+        return client.create_page(body, what=what)
+    except FatalError:
+        raise
+    except UserError:
+        if "Section" not in body["properties"]:
+            raise
+        body = dict(body, properties={k: v for k, v in body["properties"].items() if k != "Section"})
+        return client.create_page(body, what=what)
 
 
 def already_uploaded(client, cfg, unique_ids, today=None, days_back=2):
@@ -734,31 +838,40 @@ def already_uploaded(client, cfg, unique_ids, today=None, days_back=2):
 
 def create_remarks_card(client, cfg, page_id, q, ev, today):
     ds = resolve_data_source(client, cfg, "remarks_data_source_id", "remarks_database_id", "Remarks")
-    sec = SECTION_MAP.get(q["section"] or "", "Other")
-    sec = REMARKS_SECTION_MAP.get(sec, sec)
+    gs = q.get("tracker") == "gs"
+    if gs:
+        sec = q.get("paper") or "Other"
+    else:
+        sec = SECTION_MAP.get(q["section"] or "", "Other")
+        sec = REMARKS_SECTION_MAP.get(sec, sec)
     props = {
         "Name": {"title": rich([(ev.get("card_name") or q["title"][:120], False)])},
         "Date": {"date": {"start": today.isoformat()}},
         "Section": {"select": {"name": sec}},
         "Score": {"rich_text": rich([(f"{fmt_score(ev['score'])}/{fmt_score(ev['out_of'])}", False)])},
-        "Question": {"relation": [{"id": page_id}]},
     }
+    if not gs:  # the Question relation points to the Geography tracker
+        props["Question"] = {"relation": [{"id": page_id}]}
     children = []
+    if gs:
+        children.append(paragraph([("Question: ", True), (f"{q['label']}: {q['title'][:1500]} ({q.get('url') or page_id})", False)]))
     for s in ev.get("card_sections") or []:
         children.append(heading3(s.get("heading", "")))
         children += [bullet([(b, False)]) for b in s.get("bullets", [])]
-    page = client.create_page({"parent": {"type": "data_source_id", "data_source_id": ds},
-                               "properties": props, "children": children[:100]}, what="creating the Remarks card")
+    page = create_with_section_fallback(client, {"parent": {"type": "data_source_id", "data_source_id": ds},
+                                                 "properties": props, "children": children[:100]},
+                                        "creating the Remarks card")
     return page.get("url")
 
 
 def gpt_note(q, page_url, file_names, drive_dir, proof):
-    out_of = out_of_for(q)
+    out_of, wl = marking(q)
     years = ", ".join(q["years"]) or "year unknown"
+    subject = f"UPSC Mains {q['paper']}" if q.get("paper") else "UPSC Geography optional"
     lines = [
-        "Please evaluate my UPSC Geography optional answer and write the result into Notion.",
+        f"Please evaluate my {subject} answer and write the result into Notion.",
         "",
-        f'Question ({years}, {int(q["word_limit"]) if q["word_limit"] else "?"} words): "{q["title"]}"',
+        f'Question ({years}, {wl or "?"} words): "{q["title"]}"',
         f"Notion question page: {page_url}",
         f"My answer photos (in reading order) are already attached on that page under 'My answer': {', '.join(file_names)}",
     ]
@@ -767,8 +880,8 @@ def gpt_note(q, page_url, file_names, drive_dir, proof):
     lines += [
         "",
         "Please:",
-        f"1. Read the photos and evaluate strictly like a UPSC examiner, out of {out_of or 'the right total'} "
-        "(150 words = 10, 200 words = 15, 250 words = 20).",
+        f"1. Read the photos and evaluate strictly like a UPSC examiner, out of {out_of or 'the right total'}"
+        + (" (150 words = 10, 200 words = 15, 250 words = 20)." if not q.get("paper") else "."),
         "2. On the question page, under the photos, add '## Evaluation (today's date)' "
         "with the score, Strengths and Mistakes to fix.",
         "3. Fill GPT Marks and GPT Remark on the question page.",
@@ -861,7 +974,9 @@ class Context:
         self.gem = gem
         self.http = None  # session used to download photos back from Notion (tests put a fake here)
         self._rows = None
-        self._columns = None
+        self._rows_at = 0.0
+        self._columns = {}
+        self.tracker_errors = {}  # tracker key: why it could not be read (GS PYQs not connected, for example)
 
     def notion(self):
         if self.client is None:
@@ -883,18 +998,38 @@ class Context:
                                        int(self.cfg.get("gemini_retries", 4)), log=self.log)
         return self.gem
 
+    def trackers(self):
+        return ["geo", "gs"] if gs_enabled(self.cfg) else ["geo"]
+
     def tracker_rows(self, refresh=False):
-        if self._rows is None or refresh:
-            ds = resolve_data_source(self.notion(), self.cfg, "tracker_data_source_id", "tracker_database_id", "tracker")
-            pages = self.notion().all_rows(ds, what="reading the tracker questions")
-            self._rows = [read_question(p, self.cfg) for p in pages]
-            self._rows = [r for r in self._rows if r["title"]]
+        """Questions from both trackers. If GS PYQs cannot be read, Geography optional still works."""
+        max_age = float(self.cfg.get("tracker_cache_minutes", 30)) * 60
+        if self._rows is None or refresh or time.time() - self._rows_at > max_age:
+            rows = []
+            for key in self.trackers():
+                try:
+                    ds = tracker_ds(self.notion(), self.cfg, key)
+                    pages = self.notion().all_rows(ds, what=f"reading the {TRACKER_KEYS[key][2]} questions")
+                    self.tracker_errors.pop(key, None)
+                except UserError as e:
+                    if key == "geo":
+                        raise
+                    self.tracker_errors[key] = str(e).splitlines()[0]
+                    self.log(f"  GS PYQs skipped: {self.tracker_errors[key]}")
+                    continue
+                for p in pages:
+                    r = read_question(p, self.cfg)
+                    if key == "gs" and r["tracker"] != "gs":  # data source ID given but parent shows the database ID
+                        r.update(tracker="gs", in_tracker=True)
+                    if r["title"]:
+                        rows.append(r)
+            self._rows, self._rows_at = rows, time.time()
         return self._rows
 
-    def columns(self):
-        if self._columns is None:
-            self._columns = ensure_gemini_columns(self.notion(), self.cfg, self.log)
-        return self._columns
+    def columns(self, tracker="geo"):
+        if tracker not in self._columns:
+            self._columns[tracker] = ensure_gemini_columns(self.notion(), self.cfg, self.log, tracker)
+        return self._columns[tracker]
 
 
 def needs_review(ctx, s, reason, top=None, work=None):
@@ -978,8 +1113,8 @@ def process_set(ctx, s, link=None, ask_on_low_confidence=False):
             return needs_review(ctx, s, "Photo-only mode needs the question's Notion link.")
         q = read_question(ctx.notion().get_page(page_id), cfg)
         reason = "link given"
-    log(f'Question: "{q["title"]}" ({reason})')
-    out_of = out_of_for(q) or 15
+    log(f'Question ({q["label"]}): "{q["title"]}" ({reason})')
+    out_of, eval_wl = marking(q)
 
     # ---- 3. Gemini evaluates (still no Notion writes)
     ev, pending_why = None, None
@@ -987,7 +1122,8 @@ def process_set(ctx, s, link=None, ask_on_low_confidence=False):
         log("Gemini is evaluating the answer...")
         ordered_for_eval = [shrunk[i - 1] for i in order]
         try:
-            ev = gem.evaluate(ordered_for_eval, q["title"], q["years"], q["word_limit"], out_of)
+            ev = gem.evaluate(ordered_for_eval, q["title"], q["years"], eval_wl, out_of,
+                              paper=q.get("paper"), topic=q.get("topic"))
             if not read:
                 o2 = ge.valid_order(ev.get("page_order"), len(shrunk))
                 if o2:
@@ -1014,7 +1150,7 @@ def process_set(ctx, s, link=None, ask_on_low_confidence=False):
 
     # ---- 4. Notion writes
     client = ctx.notion()
-    columns = ctx.columns() if (ev or pending_why) else set()
+    columns = ctx.columns(q["tracker"]) if (ev or pending_why) else set()
     log("Uploading to Notion...")
     upload_ids = [client.upload_file(f) for f in processed]
     blocks = client.list_children(page_id)
@@ -1035,6 +1171,8 @@ def process_set(ctx, s, link=None, ask_on_low_confidence=False):
         status = cfg.get("status_after_upload", "Done")
     if status:
         props["Status"] = {"status": {"name": status}}
+    if "Date" in columns:
+        props["Date"] = {"date": {"start": today.isoformat()}}
     if ev:
         mk, rk = cfg.get("gemini_marks_property", "Gemini Marks"), cfg.get("gemini_remark_property", "Gemini Remark")
         if mk in columns:
@@ -1118,21 +1256,35 @@ def is_stop_error(err):
 def find_pending(ctx):
     """Tracker rows whose Gemini Remark starts with 'Evaluation pending', oldest first."""
     rk = ctx.cfg.get("gemini_remark_property", "Gemini Remark")
-    if rk not in ctx.columns():
-        return []
     client = ctx.notion()
-    ds = resolve_data_source(client, ctx.cfg, "tracker_data_source_id", "tracker_database_id", "tracker")
-    out, cursor = [], None
-    while True:
-        body = {"filter": {"property": rk, "rich_text": {"starts_with": PENDING_MARK}},
-                "sorts": [{"timestamp": "last_edited_time", "direction": "ascending"}], "page_size": 100}
-        if cursor:
-            body["start_cursor"] = cursor
-        data = client.query_data_source(ds, body, what="looking for answers waiting for evaluation")
-        out.extend(read_question(p, ctx.cfg) for p in data.get("results", []))
-        if not data.get("has_more"):
-            return out
-        cursor = data.get("next_cursor")
+    out = []
+    for key in ctx.trackers():
+        try:
+            if rk not in ctx.columns(key):
+                continue
+            ds = tracker_ds(client, ctx.cfg, key)
+            cursor = None
+            while True:
+                body = {"filter": {"property": rk, "rich_text": {"starts_with": PENDING_MARK}},
+                        "sorts": [{"timestamp": "last_edited_time", "direction": "ascending"}], "page_size": 100}
+                if cursor:
+                    body["start_cursor"] = cursor
+                data = client.query_data_source(ds, body, what="looking for answers waiting for evaluation")
+                for p in data.get("results", []):
+                    q = read_question(p, ctx.cfg)
+                    q["tracker"] = key
+                    out.append(q)
+                if not data.get("has_more"):
+                    break
+                cursor = data.get("next_cursor")
+        except FatalError:
+            raise
+        except UserError as e:
+            if key == "geo":
+                raise
+            ctx.tracker_errors[key] = str(e).splitlines()[0]
+    out.sort(key=lambda q: q.get("edited") or "")
+    return out
 
 
 def is_pending_block(b):
@@ -1176,11 +1328,11 @@ def download_url(ctx, url, dest):
     raise UserError(f"Could not download an answer photo back from Notion ({last}).")
 
 
-def proof_log_add_score(client, cfg, page_id, ev, today_str):
+def proof_log_add_score(client, cfg, page_id, ev, today_str, q=None):
     """Puts the score on the newest proof log row of this question that has no score yet. None if there is none."""
     ds = resolve_data_source(client, cfg, "proof_log_data_source_id", "proof_log_database_id", "proof log")
     rows = client.query_data_source(ds, {
-        "filter": {"property": "Tracker question", "relation": {"contains": page_id}},
+        "filter": proof_log_question_filter(q or {}, page_id),
         "sorts": [{"property": "No.", "direction": "descending"}], "page_size": 10},
         what="looking for the proof log row").get("results", [])
     for row in rows:
@@ -1201,11 +1353,14 @@ def evaluate_pending(ctx, q):
     cfg, log, client = ctx.cfg, ctx.log, ctx.notion()
     today = today_local()
     today_str = today.strftime("%d %b %Y")
-    page_id = q["id"]
+    page_id, tracker = q["id"], q.get("tracker") or "geo"
     q = read_question(client.get_page(page_id), cfg)
-    out_of = out_of_for(q) or 15
+    q["tracker"] = tracker
+    if tracker == "gs":
+        q["label"] = "GS PYQs" + (f", {q['paper']}" if q.get("paper") else "")
+    out_of, eval_wl = marking(q)
     rk, mk = cfg.get("gemini_remark_property", "Gemini Remark"), cfg.get("gemini_marks_property", "Gemini Marks")
-    columns = ctx.columns()
+    columns = ctx.columns(tracker)
     blocks = client.list_children(page_id)
     pending_id, photos = pending_photos(blocks)
     page_url = f"https://www.notion.so/{plain_id(page_id)}"
@@ -1226,7 +1381,8 @@ def evaluate_pending(ctx, q):
             paths.append(dst)
         log(f'Retrying the evaluation of "{q["title"][:80]}" ({len(paths)} photo(s))')
         try:
-            ev = ctx.gemini().evaluate(paths, q["title"], q["years"], q["word_limit"], out_of)
+            ev = ctx.gemini().evaluate(paths, q["title"], q["years"], eval_wl, out_of,
+                                       paper=q.get("paper"), topic=q.get("topic"))
         except ge.GeminiKeyError as e:
             raise FatalError(str(e))
 
@@ -1244,6 +1400,8 @@ def evaluate_pending(ctx, q):
             props["Status"] = {"status": {"name": status}}
         if mk in columns:
             props[mk] = {"number": ev["score"]}
+        if "Date" in columns:
+            props["Date"] = {"date": {"start": today.isoformat()}}
         if rk in columns:
             remark = ev.get("remark") or ""
             if not remark.lower().startswith("score"):
@@ -1254,7 +1412,7 @@ def evaluate_pending(ctx, q):
         proof = None
         if cfg.get("update_proof_log", True):
             try:
-                proof = proof_log_add_score(client, cfg, page_id, ev, today_str)
+                proof = proof_log_add_score(client, cfg, page_id, ev, today_str, q)
                 if proof is None:  # no row waiting for a score: make one like the normal path does
                     ids = [client.upload_file(p, f"{slugify(q['title'], 20).lower()}_p{i}.jpg")
                            for i, p in enumerate(paths, 1)]
