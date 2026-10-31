@@ -29,6 +29,11 @@ Telegram can deliver your messages to only one of them at a time. TROUBLESHOOTIN
 - /status: checks every key and shows the last run.
 - /test: a dry run. It checks everything and, if you have just sent photos, shows which question it would attach them to. It writes nothing.
 - done: finishes an answer set straight away, without waiting a minute.
+- /retry: evaluates answers that are still waiting because Gemini was busy or out of its free limit. You rarely need it: the bot also retries by itself whenever you message it.
+
+## If Gemini is busy
+
+Your photos are still attached to the right question, Gemini Remark says "Evaluation pending", and the bot tells you. The waiting list is kept in Notion, so nothing is lost when the server sleeps. Each time you message the bot later, it quietly evaluates the waiting answers, oldest first, fills Notion and sends you each evaluation. /status shows how many are waiting.
 
 ## What is in this folder
 

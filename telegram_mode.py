@@ -12,6 +12,7 @@ import os
 import re
 import shutil
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -173,7 +174,8 @@ class State:
 
 # ----------------------------------------------------------------- update handling
 
-HELP = ("Commands: /status checks every key and shows the last run; /test is a dry run that writes nothing.\n"
+HELP = ("Commands: /status checks every key and shows the last run; /test is a dry run that writes nothing; "
+        "/retry evaluates answers that are still waiting because Gemini was busy.\n"
         "Send me the photos of one answer (as photos or, for best quality, as files). "
         "I group photos sent within a minute into one answer, or send 'done' to finish a set straight away. "
         "I will find the question, attach the pages, evaluate with Gemini and fill Notion.")
@@ -196,6 +198,94 @@ def best_file(msg):
     return None
 
 
+class Retrier:
+    """Evaluates answers left as 'Evaluation pending' when Gemini was busy or out of quota.
+    The list of waiting answers lives in Notion, so nothing is lost when the server sleeps or restarts.
+    Runs in a background thread, never twice at the same time, and waits longer after each failure."""
+
+    def __init__(self, listener, base_wait=600, max_wait=6 * 3600, min_gap=60, background=True):
+        self.l = listener
+        self.lock = threading.Lock()
+        self.base_wait, self.max_wait, self.min_gap = base_wait, max_wait, min_gap
+        self.wait = base_wait
+        self.next_auto = 0.0  # automatic runs wait until this time after Gemini failed
+        self.last_auto = 0.0
+        self.bad = {}  # page id: times Gemini gave an unusable reply (skipped after 2, until restart)
+        self.background = background
+        self.thread = None
+
+    def note_failure(self):
+        self.next_auto = self.l.now() + self.wait
+        self.wait = min(self.wait * 2, self.max_wait)
+
+    def note_success(self):
+        self.wait = self.base_wait
+        self.next_auto = 0.0
+
+    def start(self, chat_id, force=False, report=False):
+        """Returns 'started', 'busy' (a retry is running), 'later' (backing off) or 'off' (Gemini switched off)."""
+        if not self.l.ctx.evaluate:
+            return "off"
+        now = self.l.now()
+        if not force and (now < self.next_auto or now - self.last_auto < self.min_gap):
+            return "later"
+        if not self.lock.acquire(blocking=False):
+            return "busy"
+        if not force:
+            self.last_auto = now
+
+        def job():
+            try:
+                self.run_locked(chat_id, report)
+            except Exception as e:  # never kill the server
+                self.l.log(f"retry problem: {e.__class__.__name__}: {e}")
+                if report:
+                    self.l.bot.send(chat_id, f"Retry problem: {e}")
+            finally:
+                self.lock.release()
+
+        if self.background:
+            self.thread = threading.Thread(target=job, name="retry-pending", daemon=True)
+            self.thread.start()
+        else:
+            job()
+        return "started"
+
+    def run_locked(self, chat_id, report):
+        def sent(res):
+            if res.get("status") == "done":
+                msgs = result_messages(res)
+                msgs[0] = "Gemini is back: here is the evaluation that was pending.\n" + msgs[0]
+                for part in msgs:
+                    self.l.bot.send(chat_id, part)
+            elif res.get("status") == "no_photos":
+                self.l.bot.send(chat_id, f'I could not find the answer photos on "{res["question"]["title"]}", '
+                                         "so I took it off the waiting list. Please send the photos again.")
+
+        skip = {k for k, n in self.bad.items() if n >= 2}
+        out = na.retry_pending(self.l.ctx, on_result=sent, skip=skip)
+        for pid, _ in out["failed"]:
+            self.bad[pid] = self.bad.get(pid, 0) + 1
+        if out["stopped"]:
+            self.note_failure()
+        elif out["done"]:
+            self.note_success()
+        if out["done"] or out["found"]:
+            self.l.record_run({"result": "retry", "reason": f"{out['done']} evaluated, {out['pending']} still waiting"})
+        if report:
+            if not out["found"]:
+                text = "No answers are waiting for evaluation."
+            else:
+                text = f"Evaluated {out['done']} waiting answer(s). Still waiting: {out['pending']}."
+                if out["stopped"]:
+                    text += ("\nGemini is still busy or out of its free limit, so I stopped. I will try again by "
+                             "myself when you next message me (the daily limit resets around 1:30 PM India time).")
+                if out["failed"]:
+                    text += f"\n{len(out['failed'])} answer(s) could not be evaluated this time."
+            self.l.bot.send(chat_id, text)
+        return out
+
+
 class Listener:
     def __init__(self, ctx, bot=None, state=None, now=time.time, log=print):
         cfg = ctx.cfg
@@ -213,6 +303,15 @@ class Listener:
             raise na.FatalError("allowed_user_ids in config.json is empty, so every message would be ignored.")
         self.bot = bot
         self.state = state or State(na.SCRIPT_DIR / "telegram_state")
+        self.retrier = Retrier(self)
+
+    def after_updates(self, updates):
+        """After handling messages from Avi, quietly try the answers still waiting for Gemini (in the background)."""
+        for upd in reversed(updates or []):
+            msg = upd.get("message") or {}
+            if (msg.get("from") or {}).get("id") in self.allowed:
+                self.retrier.start(msg["chat"]["id"])
+                return
 
     # ---- sets
     def open_set(self, chat_id):
@@ -296,6 +395,15 @@ class Listener:
             return
         if low in ("/status", "status"):
             self.bot.send(chat_id, self.status_report())
+            return
+        if low in ("/retry", "retry"):
+            r = self.retrier.start(chat_id, force=True, report=True)
+            if r == "started" and self.retrier.background:
+                self.bot.send(chat_id, "Checking the answers waiting for evaluation...")
+            elif r == "busy":
+                self.bot.send(chat_id, "I am already evaluating the waiting answers. Results will come here.")
+            elif r == "off":
+                self.bot.send(chat_id, "Gemini is switched off, so there is nothing to retry.")
             return
         if low in ("/test", "test"):
             self.bot.send(chat_id, self.test_report(chat_id))
@@ -388,6 +496,8 @@ class Listener:
                                 f"The photos are saved on the PC in {res.get('folder')}")
             return
         if status == "done":
+            if res.get("pending"):
+                self.retrier.note_failure()  # Gemini just failed: do not retry at once
             for part in result_messages(res):
                 self.bot.send(chat, part)
 
@@ -439,6 +549,17 @@ class Listener:
         for m in waiting:
             extra = f", retry at {time.strftime('%H:%M', time.localtime(m['retry_after']))}" if m.get("retry_after") else ""
             lines.append(f"  {m['id']}: {m['status']}, {m.get('count', 0)} page(s){extra}")
+        if self.ctx.evaluate:
+            try:
+                pend = na.find_pending(self.ctx)
+                lines.append(f"Answers waiting for evaluation: {len(pend)}" + (" (send /retry to try now)" if pend else ""))
+                for q in pend[:5]:
+                    lines.append(f"  {q['title'][:80]}")
+                if self.retrier.next_auto > self.now():
+                    lines.append("  Next automatic try after " + time.strftime(
+                        "%H:%M", time.gmtime(self.retrier.next_auto + 19800)) + " India time")
+            except na.UserError as e:
+                lines.append("Answers waiting for evaluation: could not check. " + str(e).splitlines()[0])
         lr = self.last_run()
         if lr:
             desc = f"{lr.get('time')}: {lr.get('result')}"
@@ -519,6 +640,7 @@ class Listener:
                 self.state.save_offset(offset)
             for meta in self.ready_sets():
                 self.process(meta)
+            self.after_updates(updates)
         return 0
 
 
@@ -550,8 +672,8 @@ def result_messages(res):
         head.append("Photos attached. Status: " + str(res.get("status_set")))
         head.append(f"Notion: {res['page_url']}")
         if res.get("pending"):
-            head.append("Gemini could not evaluate it, so I added an 'Evaluation pending' line. "
-                        "Paste the note below into ChatGPT.")
+            head.append("Gemini could not evaluate it, so I added an 'Evaluation pending' line. I will evaluate it "
+                        "by myself once Gemini is back (or send /retry). If you prefer, paste the note below into ChatGPT.")
         msgs.append("\n".join(head))
         if res.get("gpt_note"):
             msgs.append(res["gpt_note"])

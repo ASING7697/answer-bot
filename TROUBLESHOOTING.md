@@ -30,7 +30,14 @@ Where keys live:
 
 ## 2. Gemini says the daily limit is reached
 
-The free plan has a daily limit. It resets at midnight US Pacific time (about 1:30 PM India time). Meanwhile the tool still attaches your pages and adds an "Evaluation pending" line, and the bot gives you a note to paste into ChatGPT. You can see your limits in AI Studio under "Rate limit".
+The free plan has a daily limit. It resets at midnight US Pacific time (about 1:30 PM India time). Meanwhile the tool still attaches your pages, adds an "Evaluation pending" line and writes "Evaluation pending" in Gemini Remark. That Gemini Remark text is the waiting list, so do not edit it by hand.
+
+You do not need to do anything. Whenever you message the bot (any message, even "hi"), it tries the waiting answers in the background, oldest first, and stops as soon as Gemini is still busy. After a failure it waits at least 10 minutes before the next automatic try, then longer each time, so it never hammers Gemini. When an answer is evaluated, Notion is filled exactly as usual and the bot sends you the evaluation with the question.
+
+- /status shows how many answers are waiting.
+- /retry tries straight away and tells you how many were done and how many are still waiting.
+- Optional: a free cron website (for example cron-job.org) can open your Render address + /retry/ + your WEBHOOK_SECRET every hour, so waiting answers are evaluated even if you do not message the bot. Keep that link private.
+- If you would rather not wait, the bot also gives you a note to paste into ChatGPT. You can see your limits in AI Studio under "Rate limit".
 
 ## 3. Render: the bot is slow or silent
 

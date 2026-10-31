@@ -8,6 +8,7 @@ Routes:
   POST /telegram/<path>          Telegram webhook (checks X-Telegram-Bot-Api-Secret-Token)
   GET  /setup/<WEBHOOK_SECRET>   registers the webhook with Telegram (open once after deploy)
   GET  /unset/<WEBHOOK_SECRET>   removes the webhook (to switch back to the PC listener)
+  GET  /retry/<WEBHOOK_SECRET>   evaluates answers still waiting for Gemini (optional, for a free cron pinger)
 Settings come from env vars: TELEGRAM_BOT_TOKEN, NOTION_TOKEN, GEMINI_API_KEY, WEBHOOK_SECRET,
 ALLOWED_USER_IDS (comma separated). Optional: PUBLIC_URL (Render sets RENDER_EXTERNAL_URL itself).
 """
@@ -89,6 +90,7 @@ class WebhookService:
                 for meta in self.listener.ready_sets():
                     self.listener.process(meta)
                     self.processed += 1
+                self.listener.after_updates(updates)  # retries waiting evaluations in its own thread
             except na.FatalError as e:
                 self.last_error = str(e)
                 self.log("SETUP PROBLEM: " + str(e))
@@ -170,6 +172,12 @@ def make_app(service_getter=get_service):
                 return _respond(start_response, 400, {"ok": False})
             code = svc.accept(update, environ.get("HTTP_X_TELEGRAM_BOT_API_SECRET_TOKEN"))
             return _respond(start_response, code, {"ok": code == 200})
+        if path.startswith("/retry/"):
+            if not svc.secret or not hmac.compare_digest(path.split("/", 2)[2], svc.secret):
+                return _respond(start_response, 404, {"ok": False})
+            ids = sorted(svc.listener.allowed)
+            result = svc.listener.retrier.start(ids[0]) if ids else "off"
+            return _respond(start_response, 200, {"ok": True, "retry": result})
         if path.startswith("/setup/") or path.startswith("/unset/"):
             given = path.split("/", 2)[2]
             if not svc.secret or not hmac.compare_digest(given, svc.secret):

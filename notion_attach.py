@@ -31,6 +31,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -52,6 +53,7 @@ API = "https://api.notion.com/v1"
 DEFAULT_NOTION_VERSION = "2026-03-11"
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
 PLACEHOLDER_TEXT = "images pending"
+PENDING_MARK = "Evaluation pending"  # start of Gemini Remark on rows waiting for a retry (the retry queue lives in Notion)
 
 DEFAULT_CONFIG = {
     "notion_token": "PASTE_YOUR_NOTION_SECRET_HERE",
@@ -644,7 +646,8 @@ def evaluation_blocks(ev, today_str):
 def pending_block(today_str, why):
     return paragraph([("Evaluation pending: ", True),
                       (f"Gemini could not evaluate this answer on {today_str} ({why}). "
-                       "Ask ChatGPT or run the tool again for this question.", False)])
+                       "It will be evaluated automatically when Gemini is available again "
+                       "(or send /retry to the bot).", False)])
 
 
 def proof_log_update(client, cfg, page_id, q, upload_ids, attempt, today, score=None, captions=None):
@@ -856,6 +859,7 @@ class Context:
         self.evaluate = bool(cfg.get("evaluate", True)) and not args.no_eval
         self.client = client
         self.gem = gem
+        self.http = None  # session used to download photos back from Notion (tests put a fake here)
         self._rows = None
         self._columns = None
 
@@ -1010,7 +1014,7 @@ def process_set(ctx, s, link=None, ask_on_low_confidence=False):
 
     # ---- 4. Notion writes
     client = ctx.notion()
-    columns = ctx.columns() if ev else set()
+    columns = ctx.columns() if (ev or pending_why) else set()
     log("Uploading to Notion...")
     upload_ids = [client.upload_file(f) for f in processed]
     blocks = client.list_children(page_id)
@@ -1040,6 +1044,10 @@ def process_set(ctx, s, link=None, ask_on_low_confidence=False):
             if not remark.lower().startswith("score"):
                 remark = f"Score: {fmt_score(ev['score'])}/{out_of}. " + remark
             props[rk] = {"rich_text": rich([(remark[:1990], False)])}
+    elif pending_why:
+        rk = cfg.get("gemini_remark_property", "Gemini Remark")
+        if rk in columns:  # this marker is the retry queue: the bot finds these rows later and evaluates them
+            props[rk] = {"rich_text": rich([(f"{PENDING_MARK} since {today_str}: {pending_why}"[:1990], False)])}
     if props:
         client.update_page(page_id, props, what="updating Status and Gemini columns")
         log(f"  Status: {status}" + (f", Gemini Marks: {fmt_score(ev['score'])}/{out_of}" if ev else ""))
@@ -1094,6 +1102,211 @@ def process_set(ctx, s, link=None, ask_on_low_confidence=False):
             "status_set": status, "proof": proof, "card_url": card, "done_dir": str(done_dir),
             "drive_dir": str(drive_dir) if drive_dir else None, "match_reason": reason,
             "gpt_note": files.get("chatgpt_note.txt")}
+
+
+# ----------------------------------------------------------------- retrying pending evaluations
+# When Gemini fails, the photos are still attached and Gemini Remark starts with "Evaluation pending".
+# These functions find such rows, download the photos back from Notion, evaluate, and write
+# everything the normal path writes. No local state is needed, so they survive restarts.
+
+def is_stop_error(err):
+    """True when a Gemini failure means 'Gemini is busy or out of quota': stop and try again later.
+    False only for a reply problem with one answer, so the next answer can still be tried."""
+    return "unusable reply" not in str(err).lower()
+
+
+def find_pending(ctx):
+    """Tracker rows whose Gemini Remark starts with 'Evaluation pending', oldest first."""
+    rk = ctx.cfg.get("gemini_remark_property", "Gemini Remark")
+    if rk not in ctx.columns():
+        return []
+    client = ctx.notion()
+    ds = resolve_data_source(client, ctx.cfg, "tracker_data_source_id", "tracker_database_id", "tracker")
+    out, cursor = [], None
+    while True:
+        body = {"filter": {"property": rk, "rich_text": {"starts_with": PENDING_MARK}},
+                "sorts": [{"timestamp": "last_edited_time", "direction": "ascending"}], "page_size": 100}
+        if cursor:
+            body["start_cursor"] = cursor
+        data = client.query_data_source(ds, body, what="looking for answers waiting for evaluation")
+        out.extend(read_question(p, ctx.cfg) for p in data.get("results", []))
+        if not data.get("has_more"):
+            return out
+        cursor = data.get("next_cursor")
+
+
+def is_pending_block(b):
+    return b.get("type") == "paragraph" and block_text(b).strip().lower().startswith(PENDING_MARK.lower())
+
+
+def pending_photos(blocks):
+    """Returns (pending paragraph block id or None, [(url, caption)]) for the answer waiting for evaluation:
+    the images right above the last 'Evaluation pending' line, else the last run of images on the page."""
+    idx = max((i for i, b in enumerate(blocks) if is_pending_block(b)), default=None)
+    end = idx if idx is not None else len(blocks)
+    if idx is None:
+        while end > 0 and blocks[end - 1].get("type") != "image":
+            end -= 1
+    start = end
+    while start > 0 and blocks[start - 1].get("type") == "image":
+        start -= 1
+    photos = []
+    for b in blocks[start:end]:
+        img = b.get("image") or {}
+        kind = img.get("type")
+        url = (img.get(kind) or {}).get("url") if kind in ("file", "external") else None
+        if url:
+            photos.append((url, rich_text_plain(img.get("caption")).strip() or None))
+    return (blocks[idx]["id"] if idx is not None else None), photos
+
+
+def download_url(ctx, url, dest):
+    s = ctx.http or requests
+    last = None
+    for attempt in range(3):
+        try:
+            r = s.get(url, timeout=120)
+            if r.status_code == 200 and r.content:
+                Path(dest).write_bytes(r.content)
+                return dest
+            last = f"HTTP {r.status_code}"
+        except requests.exceptions.RequestException as e:
+            last = e.__class__.__name__
+        time.sleep(2 * attempt)
+    raise UserError(f"Could not download an answer photo back from Notion ({last}).")
+
+
+def proof_log_add_score(client, cfg, page_id, ev, today_str):
+    """Puts the score on the newest proof log row of this question that has no score yet. None if there is none."""
+    ds = resolve_data_source(client, cfg, "proof_log_data_source_id", "proof_log_database_id", "proof log")
+    rows = client.query_data_source(ds, {
+        "filter": {"property": "Tracker question", "relation": {"contains": page_id}},
+        "sorts": [{"property": "No.", "direction": "descending"}], "page_size": 10},
+        what="looking for the proof log row").get("results", [])
+    for row in rows:
+        props = row.get("properties", {})
+        if (props.get("Score") or {}).get("number") is None:
+            client.update_page(row["id"], {"Score": {"number": ev["score"]}}, what="writing the score in the proof log")
+            client.append_children(row["id"], [paragraph([
+                (f"Score: {fmt_score(ev['score'])} / {fmt_score(ev['out_of'])}", True),
+                (f" (evaluated by Gemini on {today_str}, after Gemini was busy)", False)])],
+                what="adding the score to the proof log row")
+            return {"action": "scored", "url": row.get("url"), "no": (props.get("No.") or {}).get("number")}
+    return None
+
+
+def evaluate_pending(ctx, q):
+    """Evaluates one pending tracker row and writes everything the normal path writes.
+    Raises ge.GeminiError when Gemini fails (nothing written), FatalError for a bad key."""
+    cfg, log, client = ctx.cfg, ctx.log, ctx.notion()
+    today = today_local()
+    today_str = today.strftime("%d %b %Y")
+    page_id = q["id"]
+    q = read_question(client.get_page(page_id), cfg)
+    out_of = out_of_for(q) or 15
+    rk, mk = cfg.get("gemini_remark_property", "Gemini Remark"), cfg.get("gemini_marks_property", "Gemini Marks")
+    columns = ctx.columns()
+    blocks = client.list_children(page_id)
+    pending_id, photos = pending_photos(blocks)
+    page_url = f"https://www.notion.so/{plain_id(page_id)}"
+    if not photos:
+        if rk in columns:  # take it out of the queue, it can never work
+            client.update_page(page_id, {rk: {"rich_text": rich([(
+                "Evaluation not possible: no answer photos found on the page. Send the photos again.", False)])}},
+                what="updating Gemini Remark")
+        return {"status": "no_photos", "question": q, "page_url": page_url}
+    work = Path(tempfile.mkdtemp(prefix="retry_"))
+    try:
+        max_bytes = int(float(cfg.get("max_file_mb", 4.5)) * 1024 * 1024)
+        paths = []
+        for i, (url, _) in enumerate(photos, 1):
+            raw = download_url(ctx, url, work / f"raw_{i}")
+            dst = work / f"p{i}.jpg"
+            shrink_image(raw, dst, int(cfg.get("max_long_side", 1800)), int(cfg.get("jpeg_quality", 85)), max_bytes)
+            paths.append(dst)
+        log(f'Retrying the evaluation of "{q["title"][:80]}" ({len(paths)} photo(s))')
+        try:
+            ev = ctx.gemini().evaluate(paths, q["title"], q["years"], q["word_limit"], out_of)
+        except ge.GeminiKeyError as e:
+            raise FatalError(str(e))
+
+        # ---- Notion writes, same content as the normal path
+        client.append_children(page_id, evaluation_blocks(ev, today_str), after=pending_id,
+                               what="adding the evaluation")
+        if pending_id:
+            client.trash_block(pending_id)
+        if ev.get("misread_demand") and cfg.get("status_when_misread"):
+            status = cfg["status_when_misread"]
+        else:
+            status = cfg.get("status_after_upload", "Done")
+        props = {}
+        if status:
+            props["Status"] = {"status": {"name": status}}
+        if mk in columns:
+            props[mk] = {"number": ev["score"]}
+        if rk in columns:
+            remark = ev.get("remark") or ""
+            if not remark.lower().startswith("score"):
+                remark = f"Score: {fmt_score(ev['score'])}/{out_of}. " + remark
+            props[rk] = {"rich_text": rich([(remark[:1990], False)])}
+        client.update_page(page_id, props, what="updating Status and Gemini columns")
+
+        proof = None
+        if cfg.get("update_proof_log", True):
+            try:
+                proof = proof_log_add_score(client, cfg, page_id, ev, today_str)
+                if proof is None:  # no row waiting for a score: make one like the normal path does
+                    ids = [client.upload_file(p, f"{slugify(q['title'], 20).lower()}_p{i}.jpg")
+                           for i, p in enumerate(paths, 1)]
+                    attempt = "Repeat" if sum(1 for b in blocks if b.get("type") == "image") > len(photos) else "First"
+                    proof = proof_log_update(client, cfg, page_id, q, ids, attempt, today, ev["score"],
+                                             [c for _, c in photos])
+            except FatalError:
+                raise
+            except UserError as e:
+                log(f"  proof log skipped: {e}")
+        card = None
+        if cfg.get("create_remarks_card", True):
+            try:
+                card = create_remarks_card(client, cfg, page_id, q, ev, today)
+            except FatalError:
+                raise
+            except UserError as e:
+                log(f"  Remarks card skipped: {e}")
+        return {"status": "done", "question": q, "page_url": page_url, "eval": ev, "pending": None,
+                "status_set": status, "proof": proof, "card_url": card, "retried": True}
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def retry_pending(ctx, on_result=None, skip=None):
+    """Evaluates every pending row, oldest first. Stops at the first 'Gemini busy or out of quota' failure.
+    Returns dict(found, done, pending, stopped, failed, results)."""
+    rows = [q for q in find_pending(ctx) if not (skip and q["id"] in skip)]
+    out = {"found": len(rows), "done": 0, "pending": len(rows), "stopped": None, "failed": [], "results": []}
+    for q in rows:
+        try:
+            res = evaluate_pending(ctx, q)
+        except FatalError:
+            raise
+        except ge.GeminiError as e:
+            if is_stop_error(e):
+                out["stopped"] = str(e)
+                ctx.log(f"  Gemini still busy, stopping the retry: {e}")
+                break
+            out["failed"].append((q["id"], str(e)))
+            continue
+        except UserError as e:
+            out["failed"].append((q["id"], str(e)))
+            ctx.log(f"  could not retry {q['title'][:60]}: {e}")
+            continue
+        out["results"].append(res)
+        out["pending"] -= 1
+        if res["status"] == "done":
+            out["done"] += 1
+        if on_result:
+            on_result(res)
+    return out
 
 
 def ask(prompt):
