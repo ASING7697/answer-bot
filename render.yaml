@@ -1,13 +1,14 @@
 # Render blueprint: one free Python web service for the Telegram webhook.
+# Used by the "Deploy to Render" button in README.md. Each person gets their own copy.
 services:
   - type: web
-    name: notion-photo-uploader
+    name: answer-bot
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn webhook_server:app --workers 1 --threads 4 --timeout 120 --bind 0.0.0.0:$PORT
     healthCheckPath: /
-    autoDeploy: false
+    autoDeployTrigger: "off"
     envVars:
       - key: PYTHON_VERSION
         value: 3.13.5
@@ -17,9 +18,9 @@ services:
         sync: false
       - key: GEMINI_API_KEY
         sync: false
-      - key: WEBHOOK_SECRET
-        sync: false
       - key: ALLOWED_USER_IDS
-        value: "8308385292"
+        sync: false
+      - key: WEBHOOK_SECRET
+        generateValue: true
       - key: GEMINI_MODEL
         value: gemini-3.8-flash

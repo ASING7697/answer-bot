@@ -15,7 +15,8 @@ You send photos of a handwritten answer to your Telegram bot. The tool then:
 
 1. **SETUP.md**: read this first. It gets your three free keys (Notion, Gemini, Telegram) and runs the tool on your Windows PC. Do this even if you plan to use Render, because it is the easiest way to check that the keys work.
 2. **DEPLOY_RENDER.md**: read this next if you want it to work while your PC is off. It puts the same tool on Render's free plan. This is the recommended main home.
-3. **TROUBLESHOOTING.md**: read this when something stops working. It covers expired keys, a sleeping server, a retired Gemini model, renamed Notion columns and more.
+3. **FRIEND_SETUP.md**: for a friend who wants their own copy. AVI_SHARING.md explains how to share it.
+4. **TROUBLESHOOTING.md**: read this when something stops working. It covers expired keys, a sleeping server, a retired Gemini model, renamed Notion columns and more.
 
 ## The two ways to run it (use only one at a time)
 
@@ -29,6 +30,7 @@ Telegram can deliver your messages to only one of them at a time. TROUBLESHOOTIN
 - /status: checks every key and shows the last run.
 - /test: a dry run. It checks everything and, if you have just sent photos, shows which question it would attach them to. It writes nothing.
 - done: finishes an answer set straight away, without waiting a minute.
+- /myid: shows your Telegram user ID. It answers anyone, so a new owner can find the ID to put in ALLOWED_USER_IDS. Everything else answers only the IDs in ALLOWED_USER_IDS.
 - /retry: evaluates answers that are still waiting because Gemini was busy or out of its free limit. You rarely need it: the bot also retries by itself whenever you message it.
 
 ## If Gemini is busy

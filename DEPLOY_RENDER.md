@@ -49,7 +49,11 @@ Before you start: finish SETUP.md Steps 4, 5 and 6, so you have your Notion key,
 5. Click "Deploy Web Service". Wait until the log says "Your service is live" (2 to 5 minutes).
 6. At the top you see your address, for example https://notion-photo-uploader.onrender.com. Open it in the browser. You should see a short line starting with {"ok": true. That is the health check.
 
+Shortcut: the Deploy to Render button in README.md fills in all of Steps 3 and 4 for you (FRIEND_SETUP.md walks through it), and makes WEBHOOK_SECRET by itself.
+
 ## Step 5. Connect Telegram to Render (once)
+
+The service now does this by itself every time it starts, so you can usually skip this step. Doing it by hand is still fine.
 
 1. If run_telegram.bat is running on your PC, close it. Only one of the two can receive messages.
 2. In your browser, open your address followed by /setup/ and your WEBHOOK_SECRET. Example:
@@ -75,9 +79,15 @@ Before you start: finish SETUP.md Steps 4, 5 and 6, so you have your Notion key,
 
 Telegram allows either Render (webhook) or the PC (polling), never both.
 
-- **To use the PC:** open your address + /unset/ + WEBHOOK_SECRET in the browser (example: https://notion-photo-uploader.onrender.com/unset/Avi_upsc_2026_x7Kp9Lm2Qw), then double-click run_telegram.bat. Or, on the PC, run: python set_webhook.py --delete
-- **To go back to Render:** close run_telegram.bat, then open the /setup/ link again.
+- **To use the PC:** first, in Render, open Environment, add AUTO_WEBHOOK with the value off, and click Save Changes. Otherwise Render takes Telegram back each time it restarts. Then open your address + /unset/ + WEBHOOK_SECRET in the browser (example: https://notion-photo-uploader.onrender.com/unset/Avi_upsc_2026_x7Kp9Lm2Qw), then double-click run_telegram.bat. Or, on the PC, run: python set_webhook.py --delete
+- **To go back to Render:** close run_telegram.bat, delete AUTO_WEBHOOK in Render's Environment (or open the /setup/ link again).
 - **To check which one is active:** on the PC, run python set_webhook.py --info (it needs webhook_secret in config.json only for setting, not for checking).
+
+## Optional settings
+
+- **ALLOWED_USER_IDS**: who may use the bot, Telegram IDs separated by commas. Send /myid to the bot to see yours.
+- **AUTO_WEBHOOK**: off stops the service from connecting Telegram by itself when it starts.
+- **GS_TRACKER_DATABASE_ID, TRACKER_DATABASE_ID, PROOF_LOG_DATABASE_ID, REMARKS_DATABASE_ID**: only needed if the bot cannot find a database by its name. The value off switches that database off.
 
 ## Changing a key or setting later
 

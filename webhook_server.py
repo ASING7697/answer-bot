@@ -48,7 +48,10 @@ class WebhookService:
         self.ctx = na.Context(args, self.cfg, client, gem, log=log)
         token = (self.cfg.get("telegram_bot_token") or "").strip()
         self.bot = bot or tm.TelegramBot(token)
-        self.listener = tm.Listener(self.ctx, bot=self.bot, state=tm.State(data / "telegram_state"), log=log)
+        if cfg is None:  # a real deploy: work out who owns this bot
+            self.cfg["allowed_user_ids"] = self.owner_ids()
+        self.listener = tm.Listener(self.ctx, bot=self.bot, state=tm.State(data / "telegram_state"), log=log,
+                                    allow_unclaimed=True)
         self.seen = collections.deque(maxlen=2000)
         self.seen_set = set()
         self.q = queue.Queue()
@@ -58,6 +61,35 @@ class WebhookService:
         self.worker = None
         if start_worker:
             self.start()
+
+    def owner_ids(self):
+        """ALLOWED_USER_IDS if set. Otherwise the user IDs in config.json, but only on the original owner's deploy,
+        recognised by its Notion key opening the tracker IDs in config.json (no one else's key can). A friend's copy
+        without ALLOWED_USER_IDS has no owner: it ignores photos and tells whoever writes how to claim it (/myid)."""
+        legacy = [int(x) for x in self.cfg.get("allowed_user_ids") or []]
+        if self.cfg.get("_allowed_from_env") or not legacy:
+            return legacy
+        try:
+            found = self.ctx.databases()
+        except na.UserError as e:  # cannot tell right now (no internet, bad key): keep the original behaviour
+            self.log(f"owner check postponed: {str(e).splitlines()[0]}")
+            return legacy
+        if any(found.get(r) == "configured" for r in ("geo", "gs")):
+            return legacy
+        self.log("No ALLOWED_USER_IDS set: the bot has no owner yet. Send it /myid on Telegram.")
+        return []
+
+    def auto_webhook(self, base_url):
+        """Points Telegram at this server if it is not already (safe to repeat; does nothing when already set)."""
+        if not self.secret or not base_url:
+            return "skipped"
+        want = base_url.rstrip("/") + "/telegram/" + webhook_path(self.secret)
+        info = self.bot.call("getWebhookInfo") or {}
+        if info.get("url") == want:
+            return "already set"
+        self.set_webhook(base_url)
+        self.log("Telegram webhook set to this server.")
+        return "set"
 
     # ---- background worker
     def start(self):
@@ -124,7 +156,8 @@ class WebhookService:
         return url
 
     def health(self):
-        return {"ok": True, "service": "notion-photo-uploader", "queued": self.q.qsize(),
+        return {"ok": True, "service": "notion-photo-uploader", "owner_set": bool(self.listener.allowed),
+                "queued": self.q.qsize(),
                 "open_sets": len(self.listener.state.sets()), "sets_processed": self.processed,
                 "last_error": self.last_error}
 
@@ -140,7 +173,25 @@ def get_service():
     with _service_lock:
         if _service is None:
             _service = WebhookService()
+            start_auto_webhook(_service)
         return _service
+
+
+def start_auto_webhook(svc, env=os.environ):
+    """On Render, set the Telegram webhook by itself at start-up, so the /setup/ link is not needed.
+    Switch off with AUTO_WEBHOOK=off (for example while using the PC listener)."""
+    base = (env.get("PUBLIC_URL") or env.get("RENDER_EXTERNAL_URL") or "").strip()
+    if not base or env.get("AUTO_WEBHOOK", "").strip().lower() in ("off", "0", "no", "false"):
+        return None
+
+    def job():
+        try:
+            svc.auto_webhook(base)
+        except Exception as e:  # never stop the server over this; /setup/ still works
+            svc.log(f"auto webhook skipped: {e}".replace(svc.bot.token or "~", "[token]"))
+    t = threading.Thread(target=job, name="auto-webhook", daemon=True)
+    t.start()
+    return t
 
 
 def _respond(start_response, status, body, ctype="application/json"):

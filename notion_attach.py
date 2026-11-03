@@ -127,6 +127,20 @@ class UserError(Exception):
     """An error with a plain-English message for Avi."""
 
 
+# The four Notion databases. If no ID is set by an environment variable, the configured IDs are used when this
+# Notion key can open them (that is Avi's own setup); otherwise the bot looks for a database with one of these
+# names among the pages shared with the integration (that is a friend who duplicated the templates).
+ROLES = {
+    "geo": ("tracker_database_id", "tracker_data_source_id", ["Geography optional"], "Tracker"),
+    "gs": ("gs_tracker_database_id", "gs_tracker_data_source_id", ["GS PYQs"], "GS PYQs tracker"),
+    "proof": ("proof_log_database_id", "proof_log_data_source_id",
+              ["Answers written", "200 Answer Challenge: Proof Log", "Proof log"], "Proof log"),
+    "remarks": ("remarks_database_id", "remarks_data_source_id", ["Remarks", "Remarks to revise"], "Remarks"),
+}
+ROLE_ENV = {"geo": "TRACKER", "gs": "GS_TRACKER", "proof": "PROOF_LOG", "remarks": "REMARKS"}
+USABLE = ("configured", "env", "found by name")
+
+
 class FatalError(UserError):
     """A problem that affects every answer (bad key, missing connection). Never moves files."""
 
@@ -162,7 +176,9 @@ def load_config(path=None):
         cfg["telegram_bot_token"] = env_tg.strip()
     env_ids = os.environ.get("ALLOWED_USER_IDS")
     if env_ids:
-        cfg["allowed_user_ids"] = [int(x) for x in re.split(r"[,\s]+", env_ids.strip()) if x.strip().lstrip("-").isdigit()]
+        cfg["allowed_user_ids"] = [int(x) for x in re.split(r"[,\s]+", env_ids.strip())
+                                   if x.strip().isdigit() and int(x) > 0]  # "0" or blank means: not set yet
+        env_ids = cfg["allowed_user_ids"] if cfg["allowed_user_ids"] else ""
     if os.environ.get("WEBHOOK_SECRET"):
         cfg["webhook_secret"] = os.environ["WEBHOOK_SECRET"].strip()
     if "DRIVE_FOLDER" in os.environ:
@@ -171,13 +187,18 @@ def load_config(path=None):
         cfg["gemini_model"] = os.environ["GEMINI_MODEL"].strip()
     if os.environ.get("GEMINI_FALLBACK_MODELS"):
         cfg["gemini_fallback_models"] = [m.strip() for m in os.environ["GEMINI_FALLBACK_MODELS"].split(",") if m.strip()]
-    for env, key in (("GS_TRACKER_DATABASE_ID", "gs_tracker_database_id"),
-                     ("GS_TRACKER_DATA_SOURCE_ID", "gs_tracker_data_source_id")):
-        if env in os.environ:  # set it to "off" to switch the GS tracker off
-            val = os.environ[env].strip()
-            cfg[key] = "" if val.lower() in ("", "off", "none") else val
-            if key == "gs_tracker_database_id" and "GS_TRACKER_DATA_SOURCE_ID" not in os.environ:
-                cfg["gs_tracker_data_source_id"] = ""  # found from the database ID
+    env_roles = set()
+    for role, (db_key, ds_key, _, _) in ROLES.items():
+        prefix = ROLE_ENV[role]
+        for env, key in ((prefix + "_DATABASE_ID", db_key), (prefix + "_DATA_SOURCE_ID", ds_key)):
+            if env in os.environ:  # set it to "off" to switch that database off
+                val = os.environ[env].strip()
+                cfg[key] = "" if val.lower() in ("", "off", "none") else val
+                env_roles.add(role)
+                if key == db_key and prefix + "_DATA_SOURCE_ID" not in os.environ:
+                    cfg[ds_key] = ""  # found from the database ID
+    cfg["_env_roles"] = sorted(env_roles)
+    cfg["_allowed_from_env"] = bool(env_ids)
     env_gem = os.environ.get("GEMINI_API_KEY")
     if env_gem:
         cfg["gemini_api_key"] = env_gem.strip()
@@ -685,6 +706,105 @@ def gs_enabled(cfg):
     return bool(cfg.get("gs_tracker_database_id") or cfg.get("gs_tracker_data_source_id"))
 
 
+def role_set(cfg, role):
+    db_key, ds_key = ROLES[role][:2]
+    return bool(cfg.get(db_key) or cfg.get(ds_key))
+
+
+def _is_network(e):
+    return str(e).startswith("Could not reach Notion")
+
+
+def can_open(client, cfg, role):
+    """True if this Notion key can open the configured database for role. Raises on a bad key or no internet."""
+    db_key, ds_key = ROLES[role][:2]
+    try:
+        if cfg.get(ds_key):
+            client.get_data_source(cfg[ds_key], what=f"the {ROLES[role][3]} database")
+        else:
+            client.get_database(cfg[db_key], what=f"the {ROLES[role][3]} database")
+        return True
+    except FatalError:
+        raise
+    except UserError as e:
+        if _is_network(e):
+            raise
+        return False
+
+
+def _title_of(obj):
+    t = obj.get("title")
+    if isinstance(t, list):
+        return rich_text_plain(t)
+    return str(t or obj.get("name") or "")
+
+
+def _norm_name(text):
+    """'🌏 Geography optional' and 'Geography Optional' both become 'geography optional'."""
+    return " ".join(re.sub(r"[^0-9a-z]+", " ", (text or "").lower()).split())
+
+
+def discover_database(client, names, log=print):
+    """Finds a database shared with the integration whose name is one of names (ignoring emoji, case and
+    punctuation). Returns (db_id, ds_id) or None."""
+    want = [_norm_name(n) for n in names]
+    hits = []
+    for name in names:
+        try:
+            data = client.request("POST", "/search", what=f"searching for the '{name}' database",
+                                  json={"query": name, "filter": {"property": "object", "value": "data_source"},
+                                        "page_size": 50})
+        except FatalError:
+            raise
+        except UserError as e:
+            if _is_network(e):
+                raise
+            log(f"  search for '{name}' failed: {str(e).splitlines()[0]}")
+            continue
+        for obj in data.get("results", []):
+            title = _norm_name(_title_of(obj))
+            if title not in want or obj.get("in_trash") or obj.get("archived"):
+                continue
+            parent = obj.get("parent") or {}
+            if obj.get("object") == "database":
+                hits.append((want.index(title), obj.get("id"), ""))
+            else:
+                hits.append((want.index(title), parent.get("database_id") or "", obj.get("id")))
+        if hits:
+            break
+    if not hits:
+        return None
+    hits.sort(key=lambda h: h[0])
+    if len({h[1] or h[2] for h in hits}) > 1:
+        log(f"  more than one database called '{names[0]}' is shared with the integration; using the first one")
+    return hits[0][1], hits[0][2]
+
+
+def find_databases(client, cfg, log=print):
+    """Works out which Notion databases to use and writes their IDs into cfg. Returns {role: how}, where how is
+    'env', 'configured', 'found by name', 'not found' or 'off'. Raises on a bad key or no internet (nothing cached)."""
+    found = {}
+    env_roles = set(cfg.get("_env_roles") or [])
+    for role, (db_key, ds_key, names, label) in ROLES.items():
+        if role in env_roles:
+            found[role] = "env" if role_set(cfg, role) else "off"
+            continue
+        discovered = set(cfg.get("_discovered") or [])
+        if role_set(cfg, role) and can_open(client, cfg, role):
+            found[role] = "found by name" if role in discovered else "configured"
+            continue
+        hit = discover_database(client, names, log)
+        if hit:
+            cfg[db_key], cfg[ds_key] = hit
+            cfg["_discovered"] = sorted(discovered | {role})
+            found[role] = "found by name"
+            log(f"  {label}: found by name in Notion")
+        else:
+            cfg[db_key], cfg[ds_key] = "", ""
+            found[role] = "not found"
+    return found
+
+
 def ensure_gemini_columns(client, cfg, log=print, tracker="geo"):
     """Create 'Gemini Marks' (number) and 'Gemini Remark' (text) on the tracker if missing.
     Returns the set of column names that are safe to write (plus 'Date' if the tracker has a date column)."""
@@ -977,6 +1097,8 @@ class Context:
         self._rows_at = 0.0
         self._columns = {}
         self.tracker_errors = {}  # tracker key: why it could not be read (GS PYQs not connected, for example)
+        self.found = None  # {role: how it was found}, see find_databases
+        self._found_at = 0.0
 
     def notion(self):
         if self.client is None:
@@ -998,8 +1120,25 @@ class Context:
                                        int(self.cfg.get("gemini_retries", 4)), log=self.log)
         return self.gem
 
+    def databases(self, refresh=False):
+        """Which Notion databases are used (cached for tracker_cache_minutes; /status refreshes it)."""
+        max_age = float(self.cfg.get("tracker_cache_minutes", 30)) * 60
+        if self.found is None or refresh or time.time() - self._found_at > max_age:
+            self.found = find_databases(self.notion(), self.cfg, self.log)
+            self._found_at = time.time()
+            self._columns = {}
+        return self.found
+
+    def has(self, role):
+        return self.databases().get(role) in USABLE
+
     def trackers(self):
-        return ["geo", "gs"] if gs_enabled(self.cfg) else ["geo"]
+        keys = [k for k in ("geo", "gs") if self.has(k)]
+        if not keys:
+            raise FatalError("NO TRACKER FOUND: the bot cannot see a 'Geography optional' or 'GS PYQs' database.\n"
+                             "Fix: open your tracker database in Notion, click the ... menu (top right), Connections, "
+                             "and add your integration. Then send /status.")
+        return keys
 
     def tracker_rows(self, refresh=False):
         """Questions from both trackers. If GS PYQs cannot be read, Geography optional still works."""
@@ -1012,10 +1151,10 @@ class Context:
                     pages = self.notion().all_rows(ds, what=f"reading the {TRACKER_KEYS[key][2]} questions")
                     self.tracker_errors.pop(key, None)
                 except UserError as e:
-                    if key == "geo":
+                    if key == "geo" or isinstance(e, FatalError):
                         raise
                     self.tracker_errors[key] = str(e).splitlines()[0]
-                    self.log(f"  GS PYQs skipped: {self.tracker_errors[key]}")
+                    self.log(f"  {TRACKER_KEYS[key][2]} skipped: {self.tracker_errors[key]}")
                     continue
                 for p in pages:
                     r = read_question(p, self.cfg)
@@ -1073,6 +1212,7 @@ def process_set(ctx, s, link=None, ask_on_low_confidence=False):
         log(f"Dry run: nothing uploaded or moved. Shrunk copies are in {work}")
         return {"status": "dry"}
 
+    ctx.databases()
     order = list(range(1, len(shrunk) + 1))
     read = None
     gem = ctx.gemini() if ctx.evaluate else None
@@ -1191,15 +1331,25 @@ def process_set(ctx, s, link=None, ask_on_low_confidence=False):
         log(f"  Status: {status}" + (f", Gemini Marks: {fmt_score(ev['score'])}/{out_of}" if ev else ""))
 
     proof = None
-    if cfg.get("update_proof_log", True):
+    if cfg.get("update_proof_log", True) and role_set(cfg, "proof"):
         attempt = "Repeat" if plan["repeat"] else "First"
-        proof = proof_log_update(client, cfg, page_id, q, upload_ids, attempt, today, ev["score"] if ev else None,
-                                 captions)
-        log(f"  proof log row No. {proof['no']} {proof['action']}")
+        try:
+            proof = proof_log_update(client, cfg, page_id, q, upload_ids, attempt, today,
+                                     ev["score"] if ev else None, captions)
+            log(f"  proof log row No. {proof['no']} {proof['action']}")
+        except FatalError:
+            raise
+        except UserError as e:  # the answer itself is already saved; do not lose it over the log
+            log(f"  proof log skipped: {str(e).splitlines()[0]}")
     card = None
-    if ev and cfg.get("create_remarks_card", True):
-        card = create_remarks_card(client, cfg, page_id, q, ev, today)
-        log("  Remarks card created")
+    if ev and cfg.get("create_remarks_card", True) and role_set(cfg, "remarks"):
+        try:
+            card = create_remarks_card(client, cfg, page_id, q, ev, today)
+            log("  Remarks card created")
+        except FatalError:
+            raise
+        except UserError as e:
+            log(f"  Remarks card skipped: {str(e).splitlines()[0]}")
 
     # ---- 5. files
     drive_dir = None
@@ -1351,6 +1501,7 @@ def evaluate_pending(ctx, q):
     """Evaluates one pending tracker row and writes everything the normal path writes.
     Raises ge.GeminiError when Gemini fails (nothing written), FatalError for a bad key."""
     cfg, log, client = ctx.cfg, ctx.log, ctx.notion()
+    ctx.databases()
     today = today_local()
     today_str = today.strftime("%d %b %Y")
     page_id, tracker = q["id"], q.get("tracker") or "geo"
@@ -1410,7 +1561,7 @@ def evaluate_pending(ctx, q):
         client.update_page(page_id, props, what="updating Status and Gemini columns")
 
         proof = None
-        if cfg.get("update_proof_log", True):
+        if cfg.get("update_proof_log", True) and role_set(cfg, "proof"):
             try:
                 proof = proof_log_add_score(client, cfg, page_id, ev, today_str, q)
                 if proof is None:  # no row waiting for a score: make one like the normal path does
@@ -1424,7 +1575,7 @@ def evaluate_pending(ctx, q):
             except UserError as e:
                 log(f"  proof log skipped: {e}")
         card = None
-        if cfg.get("create_remarks_card", True):
+        if cfg.get("create_remarks_card", True) and role_set(cfg, "remarks"):
             try:
                 card = create_remarks_card(client, cfg, page_id, q, ev, today)
             except FatalError:

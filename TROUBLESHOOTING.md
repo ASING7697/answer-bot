@@ -83,8 +83,8 @@ If Gemini Marks or Gemini Remark are missing, the tool creates them by itself. I
 ## 7. Switching between Render and the PC
 
 Only one can receive Telegram messages at a time.
-- Render to PC: open your Render address + /unset/ + your WEBHOOK_SECRET in the browser (or run python set_webhook.py --delete on the PC), then start run_telegram.bat.
-- PC to Render: close run_telegram.bat, then open your Render address + /setup/ + your WEBHOOK_SECRET.
+- Render to PC: first add AUTO_WEBHOOK with the value off in Render's Environment and click Save Changes (otherwise Render takes Telegram back whenever it restarts). Then open your Render address + /unset/ + your WEBHOOK_SECRET in the browser (or run python set_webhook.py --delete on the PC), then start run_telegram.bat.
+- PC to Render: close run_telegram.bat, delete AUTO_WEBHOOK in Render's Environment, or open your Render address + /setup/ + your WEBHOOK_SECRET.
 - Other host: see the PythonAnywhere section at the end of DEPLOY_RENDER.md.
 
 ## 8. The question was not found
@@ -106,3 +106,11 @@ Gemini puts the pages in reading order. If the order is wrong, number your pages
 ## 11. Starting over on the PC
 
 Close the window, then delete the folder telegram_state next to the program. Waiting answer sets are lost, but nothing in Notion is touched.
+
+## 12. The bot only replies with "Your Telegram user ID is ..."
+
+The bot answers only the Telegram IDs in ALLOWED_USER_IDS. Everyone else just gets their own ID back. On render.com open the service, then Environment, put your ID in ALLOWED_USER_IDS (several IDs separated by commas) and click Save Changes. Wait about 2 minutes for the restart, then send /status.
+
+## 13. "No tracker found" or a database "not found"
+
+The bot looks for databases named GS PYQs, Geography optional, Answers written and Remarks that your Notion key can see. Connect the key to each database (the ••• menu, then Connections) and keep those names. If you renamed a database, either change the name back or put its ID in Render's Environment as GS_TRACKER_DATABASE_ID, TRACKER_DATABASE_ID, PROOF_LOG_DATABASE_ID or REMARKS_DATABASE_ID. /status lists what it found.

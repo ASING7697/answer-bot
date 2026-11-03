@@ -175,7 +175,7 @@ class State:
 # ----------------------------------------------------------------- update handling
 
 HELP = ("Commands: /status checks every key and shows the last run; /test is a dry run that writes nothing; "
-        "/retry evaluates answers that are still waiting because Gemini was busy.\n"
+        "/retry evaluates answers that are still waiting because Gemini was busy; /myid shows your Telegram ID.\n"
         "Send me the photos of one answer (as photos or, for best quality, as files). "
         "I group photos sent within a minute into one answer, or send 'done' to finish a set straight away. "
         "I will find the question, attach the pages, evaluate with Gemini and fill Notion.")
@@ -287,7 +287,7 @@ class Retrier:
 
 
 class Listener:
-    def __init__(self, ctx, bot=None, state=None, now=time.time, log=print):
+    def __init__(self, ctx, bot=None, state=None, now=time.time, log=print, allow_unclaimed=False):
         cfg = ctx.cfg
         self.ctx = ctx
         self.log = log
@@ -299,7 +299,7 @@ class Listener:
             if not token or token.startswith("PASTE_"):
                 raise na.FatalError("TELEGRAM TOKEN problem: no Telegram bot token found. Paste it into config.json as telegram_bot_token.")
             bot = TelegramBot(token)
-        if not self.allowed:
+        if not self.allowed and not allow_unclaimed:
             raise na.FatalError("allowed_user_ids in config.json is empty, so every message would be ignored.")
         self.bot = bot
         self.state = state or State(na.SCRIPT_DIR / "telegram_state")
@@ -329,8 +329,16 @@ class Listener:
     def handle_update(self, upd):
         msg = upd.get("message") or {}
         user = (msg.get("from") or {}).get("id")
+        said = (msg.get("text") or "").strip().lower()
         if user not in self.allowed:
-            return  # ignore strangers completely
+            # Strangers are ignored, except /myid (harmless: it only tells them their own ID). A bot with no owner
+            # yet explains how to claim it, so a friend setting up their copy can find their ID.
+            if user is not None and (said in ("/myid", "myid") or (not self.allowed and said)):
+                self.bot.send(msg["chat"]["id"], self.myid_text(user))
+            return
+        if said in ("/myid", "myid"):
+            self.bot.send(msg["chat"]["id"], self.myid_text(user))
+            return
         chat_id = msg["chat"]["id"]
         date = float(msg.get("date") or self.now())
         f = best_file(msg)
@@ -416,6 +424,14 @@ class Listener:
             return
         self.bot.send(chat_id, HELP)
 
+    def myid_text(self, user):
+        text = f"Your Telegram user ID is {user}."
+        if not self.allowed:
+            text += ("\n\nThis bot has no owner yet, so it ignores photos. To make it yours: on render.com open this "
+                     "service, then Environment, set ALLOWED_USER_IDS to "
+                     f"{user}, and click Save Changes. The bot restarts in about a minute. Then send /status.")
+        return text
+
     # ---- processing
     def ready_sets(self):
         now = self.now()
@@ -449,7 +465,8 @@ class Listener:
         s = {"name": f"telegram_{meta['id']}", "photos": photos, "folder": None,
              "captions": [f"tg:{uids[p.name]}" if uids.get(p.name) else None for p in photos]}
         link = meta.get("link")
-        if self.ctx.cfg.get("dedupe_with_notion", True) and all(uids.get(p.name) for p in photos):
+        if self.ctx.cfg.get("dedupe_with_notion", True) and all(uids.get(p.name) for p in photos) \
+                and na.role_set(self.ctx.cfg, "proof"):
             try:
                 dup = na.already_uploaded(self.ctx.notion(), self.ctx.cfg, [uids[p.name] for p in photos])
             except na.UserError:  # a key problem is reported by the main run just below
@@ -524,25 +541,7 @@ class Listener:
             client = self.ctx.notion()
             client.request("GET", "/users/me", what="checking the Notion key")
             lines.append("Notion key: OK")
-            for key, label in (("tracker_database_id", "Tracker"), ("gs_tracker_database_id", "GS PYQs tracker"),
-                               ("proof_log_database_id", "Proof log"), ("remarks_database_id", "Remarks")):
-                if key == "gs_tracker_database_id" and not na.gs_enabled(cfg):
-                    lines.append("  GS PYQs tracker: switched off")
-                    continue
-                try:
-                    if key == "gs_tracker_database_id" and not cfg.get(key):
-                        client.get_data_source(cfg["gs_tracker_data_source_id"], what="the GS PYQs database")
-                    else:
-                        client.get_database(cfg[key], what=f"the {label} database")
-                    lines.append(f"  {label} database: connected")
-                except na.FatalError:
-                    raise
-                except na.UserError as e:
-                    if key == "gs_tracker_database_id":
-                        lines.append("  GS PYQs tracker: NOT reachable, add the connection (open GS PYQs in Notion, "
-                                     "... menu, Connections, add your integration). Geography optional still works.")
-                    else:
-                        lines.append(f"  {label} database: NOT reachable. {str(e).splitlines()[0]}")
+            lines += self.database_lines(client)
         except na.UserError as e:
             lines.append("Notion key: FAILED. " + str(e))
         if self.ctx.evaluate:
@@ -553,6 +552,38 @@ class Listener:
                 lines.append("Gemini key/model: FAILED. " + str(e))
         else:
             lines.append("Gemini: switched off (photo-only mode)")
+        return lines
+
+    def database_lines(self, client):
+        """One line per Notion database: connected (and whether it was found by name), not found, or off."""
+        cfg, lines = self.ctx.cfg, []
+        try:
+            found = self.ctx.databases(refresh=True)
+        except na.FatalError:
+            raise
+        except na.UserError as e:
+            return ["  Databases: could not check. " + str(e).splitlines()[0]]
+        connect = "(open it in Notion, ... menu, Connections, add your integration)"
+        for role, (_, _, names, label) in na.ROLES.items():
+            how = found.get(role)
+            if how == "off":
+                lines.append(f"  {label}: switched off")
+            elif how == "not found":
+                if role == "gs":
+                    lines.append("  GS PYQs tracker: NOT reachable, add the connection (open GS PYQs in Notion, "
+                                 "... menu, Connections, add your integration)."
+                                 + (" Geography optional still works." if found.get("geo") in na.USABLE else ""))
+                elif role == "geo":
+                    lines.append("  Geography optional tracker: not found. Fine if you only use GS PYQs; "
+                                 f"otherwise add the connection {connect}.")
+                else:
+                    lines.append(f"  {label} database: not found (optional; to use it, share '{names[0]}' "
+                                 f"with your integration {connect}).")
+            elif how == "env" and not na.can_open(client, cfg, role):
+                lines.append(f"  {label} database: NOT reachable. Check {na.ROLE_ENV[role]}_DATABASE_ID on Render "
+                             f"and the connection {connect}.")
+            else:
+                lines.append(f"  {label} database: connected" + (" (found by name)" if how == "found by name" else ""))
         return lines
 
     def status_report(self):
