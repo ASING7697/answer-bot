@@ -1691,6 +1691,82 @@ def answer_part_for(ctx, paths, q):
     return [paths[i - 1] for i in best["photos"]], len(groups) - 1
 
 
+def rearrange_page(ctx, page_id):
+    """One-off clean-up for a page that got the photos of several answers at once (before batches were split).
+    Reads the photos of the last answer on the page, splits them into answers, attaches every group that belongs
+    to another question to that question's page (appending, evaluated like a normal answer), and only after a
+    group is safely attached removes its image blocks from this page. Groups that cannot be matched stay put.
+    Finally evaluates what is left on this page if it is waiting."""
+    cfg, client, gem = ctx.cfg, ctx.notion(), ctx.gemini()
+    ctx.databases()
+    q = read_question(client.get_page(page_id), cfg)
+    blocks = client.list_children(page_id)
+    pending_id, photos = pending_photos(blocks)
+    ids = []
+    if photos:  # block ids of the same images pending_photos found (the run right above the pending line)
+        idx = max((i for i, b in enumerate(blocks) if is_pending_block(b)), default=None)
+        end = idx if idx is not None else len(blocks)
+        if idx is None:
+            while end > 0 and blocks[end - 1].get("type") != "image":
+                end -= 1
+        start = end
+        while start > 0 and blocks[start - 1].get("type") == "image":
+            start -= 1
+        ids = [b["id"] for b in blocks[start:end]]
+    out = {"photos": len(photos), "groups": 1, "moved": [], "left": [], "removed": 0, "own": None, "own_status": None}
+    if len(photos) < 2 or len(ids) != len(photos):
+        return out
+    work = Path(tempfile.mkdtemp(prefix="sort_"))
+    try:
+        max_bytes = int(float(cfg.get("max_file_mb", 4.5)) * 1024 * 1024)
+        paths = []
+        for i, (url, _) in enumerate(photos, 1):
+            raw = download_url(ctx, url, work / f"raw_{i}")
+            dst = work / f"photo_{i:03d}.jpg"
+            shrink_image(raw, dst, int(cfg.get("max_long_side", 1800)), int(cfg.get("jpeg_quality", 85)), max_bytes)
+            paths.append(dst)
+        groups = ge.group_photos(gem.read_answer(paths), len(paths))
+        out["groups"] = len(groups)
+        if len(groups) < 2:
+            return out
+        own = max(groups, key=lambda g: ge.similarity(g.get("question_written") or "", q["title"]))
+        to_remove = []
+        for k, g in enumerate(groups, 1):
+            if g is own:
+                continue
+            where = photo_range(g["photos"])
+            sub = {"name": f"sorted_{k}", "photos": [paths[i - 1] for i in g["photos"]], "folder": None,
+                   "captions": [photos[i - 1][1] for i in g["photos"]]}
+            try:
+                read = g.get("read") or gem.read_answer(sub["photos"])
+                cand, reason, _ = choose_question(cfg, gem, read, ctx.tracker_rows(), ctx.log)
+                if cand is None or plain_id(cand["id"]) == plain_id(page_id):
+                    out["left"].append((where, reason if cand is None else "belongs to this page"))
+                    continue
+                res = process_set(ctx, sub, link=cand["id"])
+            except FatalError:
+                raise
+            except (UserError, ge.GeminiError) as e:
+                res = {"status": "failed", "reason": str(e)}
+            if res.get("status") == "done":
+                out["moved"].append(res)
+                to_remove += [ids[i - 1] for i in g["photos"]]
+            else:
+                out["left"].append((where, res.get("reason") or "could not attach"))
+        for bid in to_remove:  # only photos already attached on their right page
+            client.trash_block(bid)
+        out["removed"] = len(to_remove)
+        if pending_id:
+            try:
+                res = evaluate_pending(ctx, {"id": page_id, "tracker": q.get("tracker")})
+                out["own"], out["own_status"] = res, "evaluated" if res.get("status") == "done" else res.get("status")
+            except ge.GeminiError as e:
+                out["own_status"] = f"still waiting for Gemini ({e})"
+        return out
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def retry_pending(ctx, on_result=None, skip=None):
     """Evaluates every pending row, oldest first. Stops at the first 'Gemini busy or out of quota' failure.
     Returns dict(found, done, pending, stopped, failed, results)."""

@@ -179,7 +179,8 @@ HELP = ("Commands: /status checks every key and shows the last run; /test is a d
         "Send me the photos of one answer (as photos or, for best quality, as files). "
         "I group photos sent within a minute into one set, or send 'done' to finish a set straight away. "
         "You can send several answers in one go: I split them by where a new question is written at the top "
-        "of a page. To force a split, send 'next' between two answers. "
+        "of a page. To force a split, send 'next' between two answers. If one page got several answers by "
+        "mistake, send /rearrange followed by its Notion link. "
         "I will find the question, attach the pages, evaluate with Gemini and fill Notion.")
 
 
@@ -401,6 +402,21 @@ class Listener:
         if low in ("done", "/done", "finish", "end") and cur:
             cur["status"] = "ready"
             self.state.save(cur)
+            return
+        if low.startswith(("/rearrange", "rearrange", "/sort", "sort")) and link_id:
+            self.bot.send(chat_id, "Sorting the photos on that page into separate answers. This can take a few minutes...")
+            try:
+                out = na.rearrange_page(self.ctx, link_id)
+            except na.FatalError:
+                raise
+            except (na.UserError, na.ge.GeminiError) as e:
+                self.bot.send(chat_id, f"Could not sort that page: {e}\nNothing was removed.")
+                return
+            self.bot.send(chat_id, rearrange_text(out))
+            for res in out["moved"] + ([out["own"]] if out.get("own") else []):
+                if res.get("status") == "done" and res.get("eval"):
+                    for part in result_messages(res):
+                        self.bot.send(chat_id, part)
             return
         if low in ("next", "/next", "split", "/split"):
             if cur:
@@ -781,6 +797,19 @@ def result_messages(res):
         if res.get("gpt_note"):
             msgs.append(res["gpt_note"])
     return msgs
+
+
+def rearrange_text(out):
+    lines = [f"That page had {out['photos']} photos holding {out['groups']} answers."]
+    if out["groups"] < 2:
+        return lines[0] + " Nothing to move."
+    lines.append(f"Moved to their own question pages: {len(out['moved'])} answer(s), "
+                 f"{out['removed']} photo(s) taken off the first page.")
+    for where, why in out["left"]:
+        lines.append(f"Left in place ({why}): {where}")
+    if out.get("own_status"):
+        lines.append("This page's own answer: " + out["own_status"])
+    return "\n".join(lines)
 
 
 def run_telegram(ctx, **kw):
