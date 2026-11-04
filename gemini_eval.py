@@ -339,7 +339,7 @@ def group_photos(read, n, hard_breaks=()):
 
 class GeminiClient:
     def __init__(self, api_key, model=DEFAULT_MODEL, fallbacks=None, timeout=180, retries=4,
-                 session=None, sleep=time.sleep, log=print):
+                 session=None, sleep=time.sleep, log=print, budget=None, clock=time.monotonic):
         self.key = (api_key or "").strip()
         self.models = [model] + [m for m in (fallbacks if fallbacks is not None else DEFAULT_FALLBACKS) if m != model]
         self.timeout = timeout
@@ -348,6 +348,10 @@ class GeminiClient:
         self.sleep = sleep
         self.log = log
         self.used_model = None
+        # Total seconds one request may take across all retries and models. After that the answer is
+        # left as 'Evaluation pending' for the retry queue instead of blocking the bot for many minutes.
+        self.budget = float(budget if budget is not None else os.environ.get("GEMINI_BUDGET_SECONDS", 300))
+        self.clock = clock
 
     def _redact(self, text):
         text = str(text)
@@ -378,17 +382,27 @@ class GeminiClient:
                                  "temperature": 0.2},
         }
         last = "unknown problem"
+        start = self.clock()
+
+        def left():
+            return self.budget - (self.clock() - start) if self.budget > 0 else float("inf")
+
+        def nap(sec):
+            self.sleep(max(0, min(sec, left())))
+
         for model in self.models:
             url = f"{GEMINI_API}/models/{model}:generateContent"
             for attempt in range(self.retries):
+                if left() <= 5:
+                    raise GeminiError(f"{what} took too long ({last}); it will be tried again later")
                 wait = min(60, 4 * (2 ** attempt))
                 try:
                     r = self.s.post(url, headers={"x-goog-api-key": self.key, "Content-Type": "application/json"},
-                                    json=body, timeout=self.timeout)
+                                    json=body, timeout=min(self.timeout, max(10, left())))
                 except requests.exceptions.RequestException as e:
                     last = self._redact(f"network problem: {e.__class__.__name__}")
                     self.log(f"  {what}: {last}, retrying in {wait} s")
-                    self.sleep(wait)
+                    nap(wait)
                     continue
                 status = r.status_code
                 if status == 200:
@@ -401,7 +415,7 @@ class GeminiClient:
                     except (ValueError, KeyError, TypeError) as e:
                         last = f"unusable reply ({self._redact(e)})"
                         self.log(f"  {what}: {last}, asking again")
-                        self.sleep(2)
+                        nap(2)
                         continue
                 err = self._error_text(r)
                 if status in (400, 401, 403) and ("api key" in err.lower() or "permission" in err.lower()
@@ -420,12 +434,12 @@ class GeminiClient:
                     delay = self._retry_delay(r) or wait
                     last = "rate limit (429)"
                     self.log(f"  {what}: busy (429), waiting {delay:.0f} s")
-                    self.sleep(min(delay, 90))
+                    nap(min(delay, 90))
                     continue
                 if status >= 500:
                     last = f"Gemini server error {status}"
                     self.log(f"  {what}: {last}, retrying in {wait} s")
-                    self.sleep(wait)
+                    nap(wait)
                     continue
                 last = f"HTTP {status}: {err}"
                 break
