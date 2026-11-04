@@ -936,7 +936,7 @@ def create_with_section_fallback(client, body, what):
 
 
 def already_uploaded(client, cfg, unique_ids, today=None, days_back=2):
-    """True if every Telegram photo ID is already in a recent proof log row (stored as image captions 'tg:<id>').
+    """True if a recent proof log row holds exactly these Telegram photo IDs (stored as image captions 'tg:<id>').
     Used to skip repeats after a restart of the webhook server."""
     want = {f"tg:{u}" for u in unique_ids if u}
     if not want:
@@ -950,8 +950,12 @@ def already_uploaded(client, cfg, unique_ids, today=None, days_back=2):
         found = set()
         for b in client.list_children(row["id"], what="checking for repeats"):
             if b.get("type") == "image":
-                found.add(rich_text_plain((b.get("image") or {}).get("caption")).strip())
-        if want <= found:
+                cap = rich_text_plain((b.get("image") or {}).get("caption")).strip()
+                if cap.startswith("tg:"):
+                    found.add(cap)
+        # Only the exact same set counts as a repeat. Part of an earlier batch sent again
+        # (for example one answer re-sent on its own after a mixed batch) is new work.
+        if want == found:
             return row.get("url") or row["id"]
     return None
 
