@@ -114,3 +114,10 @@ The bot answers only the Telegram IDs in ALLOWED_USER_IDS. Everyone else just ge
 ## 13. "No tracker found" or a database "not found"
 
 The bot looks for databases named GS PYQs, Geography optional, Answers written and Remarks that your Notion key can see. Connect the key to each database (the ••• menu, then Connections) and keep those names. If you renamed a database, either change the name back or put its ID in Render's Environment as GS_TRACKER_DATABASE_ID, TRACKER_DATABASE_ID, PROOF_LOG_DATABASE_ID or REMARKS_DATABASE_ID. /status lists what it found.
+
+## I sent several answers in one go
+
+That is fine. The bot reads every photo and starts a new answer wherever a new question is written at the top
+of a page, then attaches and evaluates each answer on its own question page. Any answer it cannot match is not
+attached anywhere; the bot lists those photo numbers so you can send them again on their own. To force a split,
+send the word `next` between two answers.

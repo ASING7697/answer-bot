@@ -177,7 +177,9 @@ class State:
 HELP = ("Commands: /status checks every key and shows the last run; /test is a dry run that writes nothing; "
         "/retry evaluates answers that are still waiting because Gemini was busy; /myid shows your Telegram ID.\n"
         "Send me the photos of one answer (as photos or, for best quality, as files). "
-        "I group photos sent within a minute into one answer, or send 'done' to finish a set straight away. "
+        "I group photos sent within a minute into one set, or send 'done' to finish a set straight away. "
+        "You can send several answers in one go: I split them by where a new question is written at the top "
+        "of a page. To force a split, send 'next' between two answers. "
         "I will find the question, attach the pages, evaluate with Gemini and fill Notion.")
 
 
@@ -256,6 +258,10 @@ class Retrier:
             if res.get("status") == "done":
                 msgs = result_messages(res)
                 msgs[0] = "Gemini is back: here is the evaluation that was pending.\n" + msgs[0]
+                if res.get("other_answers"):
+                    msgs[0] += (f"\nNote: this page also has photos of {res['other_answers']} other answer(s) that "
+                                "were sent together with it. I evaluated only the part that answers this question "
+                                "and left every photo where it is.")
                 for part in msgs:
                     self.l.bot.send(chat_id, part)
             elif res.get("status") == "no_photos":
@@ -396,6 +402,14 @@ class Listener:
             cur["status"] = "ready"
             self.state.save(cur)
             return
+        if low in ("next", "/next", "split", "/split"):
+            if cur:
+                cur.setdefault("breaks", [])
+                if cur["count"] + 1 not in cur["breaks"]:
+                    cur["breaks"].append(cur["count"] + 1)
+                self.state.save(cur)
+            self.bot.send(chat_id, "OK, the next photo starts a new answer.")
+            return
         if link_id and cur:
             cur["link"] = link_id
             self.state.save(cur)
@@ -463,7 +477,8 @@ class Listener:
             self.state.save(meta)
         uids = meta.get("unique_ids") or {}
         s = {"name": f"telegram_{meta['id']}", "photos": photos, "folder": None,
-             "captions": [f"tg:{uids[p.name]}" if uids.get(p.name) else None for p in photos]}
+             "captions": [f"tg:{uids[p.name]}" if uids.get(p.name) else None for p in photos],
+             "breaks": list(meta.get("breaks") or [])}
         link = meta.get("link")
         if self.ctx.cfg.get("dedupe_with_notion", True) and all(uids.get(p.name) for p in photos) \
                 and na.role_set(self.ctx.cfg, "proof"):
@@ -493,6 +508,10 @@ class Listener:
         except Exception as e:  # never lose the photos
             res = na.needs_review(self.ctx, s, f"Unexpected error: {e.__class__.__name__}: {e}")
         status = res.get("status")
+        if status == "multi":
+            shutil.rmtree(d, ignore_errors=True)
+            self.report_batch(chat, res)
+            return
         self.record_run({"result": status, "question": (res.get("question") or {}).get("title"),
                          "score": na.fmt_score((res.get("eval") or {}).get("score")) if res.get("eval") else None,
                          "reason": res.get("reason"), "page": res.get("page_url")})
@@ -518,6 +537,43 @@ class Listener:
                 self.retrier.note_failure()  # Gemini just failed: do not retry at once
             for part in result_messages(res):
                 self.bot.send(chat, part)
+
+    def report_batch(self, chat, res):
+        """Replies for a batch that held several answers: one block per answer, then a short summary."""
+        results = res["results"]
+        self.bot.send(chat, f"These photos hold {len(results)} different answers: "
+                      + "; ".join(na.photo_range(nums) for nums, _ in results) + ". I handled each one separately.")
+        done = pend = 0
+        unmatched = []
+        for nums, r in results:
+            where = na.photo_range(nums)
+            st = r.get("status")
+            if st == "done":
+                done += 1
+                if r.get("pending"):
+                    pend += 1
+                    self.retrier.note_failure()
+                msgs = result_messages(r)
+                msgs[0] = f"Answer in {where}:\n" + msgs[0]
+                for part in msgs:
+                    self.bot.send(chat, part)
+            else:
+                unmatched.append((where, r))
+        for where, r in unmatched:
+            lines = [f"Answer in {where}: NOT attached anywhere ({r.get('reason') or r.get('status')})."]
+            top = (r.get("top") or [])[:3]
+            if top:
+                lines.append("Closest questions:")
+                lines += [f"- {c['title']}" for _, c in top]
+            lines.append(f"Please send {where} again on their own (you can add the question's Notion link).")
+            self.bot.send(chat, "\n".join(lines))
+        summary = f"Batch finished: {done} of {len(results)} answers attached"
+        if pend:
+            summary += f", {pend} waiting for Gemini (I will evaluate them by myself, or send /retry)"
+        if unmatched:
+            summary += f", {len(unmatched)} not matched (see above)"
+        self.bot.send(chat, summary + ".")
+        self.record_run({"result": "batch", "reason": summary})
 
     # ---- status and test
     def record_run(self, info):

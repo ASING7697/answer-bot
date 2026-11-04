@@ -8,7 +8,9 @@ The API key is sent only in the x-goog-api-key header and is never printed.
 
 import base64
 import difflib
+import io
 import json
+import os
 import re
 import time
 
@@ -55,16 +57,28 @@ def clean_obj(o):
 
 # ----------------------------------------------------------------- schemas
 
+_PHOTO = {
+    "type": "OBJECT",
+    "properties": {
+        "photo": {"type": "INTEGER", "description": "Photo number as given (1, 2, 3 ...)."},
+        "starts_new_answer": {"type": "BOOLEAN", "description": "True if a NEW question is written at the top of this photo, so a new answer begins here. False if the page simply continues the answer on the previous photo."},
+        "question_at_top": {"type": "STRING", "description": "The question text written at the top of this photo, copied exactly, or empty string if the page is a continuation."},
+        "first_words": {"type": "STRING", "description": "The first few words written on this photo (up to 12 words)."},
+    },
+    "required": ["photo", "starts_new_answer", "question_at_top", "first_words"],
+}
+
 READ_SCHEMA = {
     "type": "OBJECT",
     "properties": {
+        "photos": {"type": "ARRAY", "items": _PHOTO, "description": "One entry for EVERY photo, in the order given."},
         "question_written": {"type": "STRING", "description": "The exam question exactly as written on the pages, or empty string if no question is written."},
         "question_guess": {"type": "STRING", "description": "If no question is written: one sentence describing what question this answer seems to address. Otherwise repeat the written question."},
         "page_order": {"type": "ARRAY", "items": {"type": "INTEGER"}, "description": "Photo numbers in correct reading order, each photo exactly once."},
-        "answer_summary": {"type": "STRING", "description": "Short summary of what the answer covers (main headings, thinkers, diagrams), under 120 words."},
+        "answer_summary": {"type": "STRING", "description": "Short summary of what the (first) answer covers (main headings, thinkers, diagrams), under 120 words."},
         "legible": {"type": "BOOLEAN"},
     },
-    "required": ["question_written", "question_guess", "page_order", "answer_summary", "legible"],
+    "required": ["photos", "question_written", "question_guess", "page_order", "answer_summary", "legible"],
 }
 
 PICK_SCHEMA = {
@@ -110,10 +124,17 @@ STYLE_RULES = (
 )
 
 READ_SYSTEM = (
-    "You read photos of a handwritten UPSC Civil Services Geography Optional answer. "
-    "The photos may arrive shuffled. Work out the correct reading order from the flow of the text, page "
-    "numbering, question numbering and where sentences continue. Copy the question text exactly if it is "
-    "written on any page. " + STYLE_RULES
+    "You read photos of handwritten UPSC Civil Services Mains answers (Geography Optional or General Studies). "
+    "IMPORTANT: one batch of photos may hold SEVERAL DIFFERENT answers sent together, one after another, in the "
+    "order given. There are usually no question numbers or page numbers. Decide purely from the content of each "
+    "photo: a new answer starts on a photo whose top has a new question written out (often a quoted or underlined "
+    "question, sometimes with the year or word limit); a photo that carries on the sentences, headings or "
+    "diagrams of the previous photo is a continuation. For EVERY photo, fill one entry in 'photos': "
+    "starts_new_answer, the question at its top copied exactly (empty for continuations) and its first words. "
+    "Photo 1 always starts an answer. Do not merge two different questions into one answer. "
+    "question_written, question_guess and answer_summary describe the FIRST answer. page_order lists all photo "
+    "numbers in reading order (keep the given order unless the photos of a single answer are clearly shuffled). "
+    + STYLE_RULES
 )
 
 EVAL_SYSTEM = """You are a strict, honest UPSC Civil Services examiner for Geography Optional, acting as Avi's answer evaluator.
@@ -208,9 +229,34 @@ def top_matches(query, candidates, n=5):
 
 # ----------------------------------------------------------------- client
 
+MAX_INLINE_BYTES = 12 * 1024 * 1024  # photos per Gemini request (base64 adds a third; Gemini's limit is about 20 MB)
+READ_SIDE = 1280  # long side of the copies used only to read and split a batch (enough for handwriting)
+
+
 def _b64(path):
     with open(path, "rb") as f:
         return base64.b64encode(f.read()).decode("ascii")
+
+
+def _smaller_jpeg(path, steps, budget):
+    """Smaller JPEG copy in memory: tries each long side in steps until it fits the byte budget."""
+    try:
+        from PIL import Image
+    except ImportError:  # Pillow missing: send the file as it is
+        with open(path, "rb") as f:
+            return f.read()
+    data = b""
+    with Image.open(path) as im:
+        im = im.convert("RGB")
+        for side in steps:
+            w = im.copy()
+            w.thumbnail((side, side))
+            buf = io.BytesIO()
+            w.save(buf, "JPEG", quality=75, optimize=True)
+            data = buf.getvalue()
+            if len(data) <= budget:
+                break
+    return data
 
 
 def valid_order(order, n):
@@ -219,6 +265,76 @@ def valid_order(order, n):
     except Exception:
         return None
     return order if sorted(order) == list(range(1, n + 1)) else None
+
+
+def repair_order(order, n):
+    """A usable reading order even when Gemini's list is imperfect (a photo missing, repeated or out of range):
+    keeps the first valid mention of each photo, then adds any missing ones in the order they were sent.
+    Gemini often gets this list slightly wrong with many photos; that must never block an evaluation."""
+    out, seen = [], set()
+    for x in order if isinstance(order, (list, tuple)) else []:
+        try:
+            k = int(x)
+        except (TypeError, ValueError):
+            continue
+        if 1 <= k <= n and k not in seen:
+            seen.add(k)
+            out.append(k)
+    return out + [k for k in range(1, n + 1) if k not in seen]
+
+
+def group_photos(read, n, hard_breaks=()):
+    """Splits a batch of n photos into separate answers, keeping the order they were sent.
+    read: the reply of read_answer (its 'photos' list says where a new question starts).
+    hard_breaks: photo numbers where Avi forced a new answer (he sent 'next' between photos).
+    Returns a list of dicts: photos (1-based numbers), question_written, read (a read_answer style dict or None
+    when the question is not known and the group has to be read on its own)."""
+    info = {}
+    for e in (read or {}).get("photos") or []:
+        try:
+            k = int(e.get("photo"))
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if 1 <= k <= n and k not in info:
+            info[k] = e
+    starts = {1} | {int(b) for b in hard_breaks or () if 1 <= int(b) <= n}
+    current_q = ""
+    for k in range(1, n + 1):
+        e = info.get(k) or {}
+        qtop = clean_text((e.get("question_at_top") or "").strip())
+        if k == 1 or k in starts:
+            current_q = qtop
+            continue
+        if e.get("starts_new_answer") and qtop:
+            starts.add(k)
+            current_q = qtop
+        elif qtop and current_q and similarity(qtop, current_q) < 0.5 and len(_words(qtop)) >= 4:
+            starts.add(k)  # a different question at the top even though the flag was missed
+            current_q = qtop
+        elif qtop and not current_q:
+            current_q = qtop
+    bounds = sorted(starts) + [n + 1]
+    groups = []
+    for a, b in zip(bounds, bounds[1:]):
+        photos = list(range(a, b))
+        qtop = clean_text(((info.get(a) or {}).get("question_at_top") or "").strip())
+        groups.append({"photos": photos, "question_written": qtop, "read": None})
+    if len(groups) == 1:
+        one = dict(read or {})
+        one["page_order"] = repair_order(one.get("page_order"), n)
+        groups[0]["read"] = one if (one.get("question_written") or one.get("question_guess")) else None
+        groups[0]["question_written"] = one.get("question_written") or groups[0]["question_written"]
+        return groups
+    first_q = clean_text((read or {}).get("question_written") or "")
+    for g in groups:
+        q = g["question_written"]
+        if g["photos"][0] == 1 and not q:
+            q = first_q
+        if q:
+            summary = (read or {}).get("answer_summary", "") if g["photos"][0] == 1 else ""
+            g["read"] = {"question_written": q, "question_guess": q, "answer_summary": summary,
+                         "page_order": list(range(1, len(g["photos"]) + 1)), "legible": True}
+    return groups
 
 
 class GeminiClient:
@@ -357,24 +473,38 @@ class GeminiClient:
     # ------------------------------------------------------------- tasks
 
     @staticmethod
-    def image_parts(paths):
+    def image_parts(paths, max_total_bytes=MAX_INLINE_BYTES, side=None):
+        """Photos as inline parts. Gemini refuses requests over about 20 MB, so when the photos together are
+        bigger than max_total_bytes (or side is given) smaller copies are made in memory, one at a time."""
+        sizes = [os.path.getsize(p) for p in paths]
+        need = side is not None or sum(sizes) > max_total_bytes
         parts = []
+        steps = [side] if side else [1600, 1280, 1024, 800, 640]
+        budget = max_total_bytes / max(1, len(paths))
         for i, p in enumerate(paths, 1):
             parts.append({"text": f"Photo {i}:"})
-            parts.append({"inline_data": {"mime_type": "image/jpeg", "data": _b64(p)}})
+            if need and (side or sizes[i - 1] > budget):
+                data = _smaller_jpeg(p, steps, budget)
+            else:
+                with open(p, "rb") as f:
+                    data = f.read()
+            parts.append({"inline_data": {"mime_type": "image/jpeg", "data": base64.b64encode(data).decode("ascii")}})
         return parts
 
     def read_answer(self, paths):
         n = len(paths)
 
         def check(d):
-            if not valid_order(d.get("page_order"), n):
-                raise ValueError("page_order is not a full list of the photos")
+            if not isinstance(d.get("question_written", ""), str):
+                raise ValueError("question_written missing")
 
-        parts = self.image_parts(paths) + [{"text": (
-            f"There are {n} photos. Give the reading order as photo numbers, the question if written, "
-            "otherwise your best description of the question, and a short summary of the answer.")}]
-        return self.generate_json(READ_SYSTEM, parts, READ_SCHEMA, check, what="Reading the photos")
+        parts = self.image_parts(paths, side=READ_SIDE if n > 3 else None) + [{"text": (
+            f"There are {n} photos, in the order they were sent. For every photo say whether a new question starts "
+            "at its top. Then give the reading order as photo numbers, the first question if written, otherwise "
+            "your best description of it, and a short summary of the first answer.")}]
+        data = self.generate_json(READ_SYSTEM, parts, READ_SCHEMA, check, what="Reading the photos")
+        data["page_order"] = repair_order(data.get("page_order"), n)
+        return data
 
     def pick_candidate(self, read, candidates):
         lines = [f"{i}. " + (f"[{c['label']}] " if c.get("label") else "") + c["title"]
@@ -395,10 +525,8 @@ class GeminiClient:
         """paper set (GS1 to GS4 or Essay) means a GS Mains question; otherwise Geography optional."""
         n = len(paths)
 
-        def check(d):
+        def check(d):  # page_order is not checked: the photos are already in reading order here
             float(d["score"])
-            if not valid_order(d.get("page_order"), n):
-                raise ValueError("page_order is not a full list of the photos")
             if not d.get("strengths") or not d.get("mistakes"):
                 raise ValueError("strengths or mistakes missing")
 

@@ -1099,6 +1099,7 @@ class Context:
         self.tracker_errors = {}  # tracker key: why it could not be read (GS PYQs not connected, for example)
         self.found = None  # {role: how it was found}, see find_databases
         self._found_at = 0.0
+        self.in_progress = set()  # question pages being evaluated right now (the retry queue leaves them alone)
 
     def notion(self):
         if self.client is None:
@@ -1189,9 +1190,50 @@ def needs_review(ctx, s, reason, top=None, work=None):
     return {"status": "review", "reason": reason, "folder": str(target), "top": top or []}
 
 
-def process_set(ctx, s, link=None, ask_on_low_confidence=False):
+def process_batch(ctx, s, groups):
+    """A batch that holds several different answers: each group of photos is handled as if it had been sent on its
+    own (own question, own attach, own evaluation). A group whose question cannot be matched is attached nowhere.
+    Returns dict(status='multi', results=[(photo numbers, result)])."""
+    log = ctx.log
+    log(f"This set holds {len(groups)} different answers: "
+        + "; ".join(photo_range(g["photos"]) for g in groups))
+    results = []
+    caps = s.get("captions") or [None] * len(s["photos"])
+    for k, g in enumerate(groups, 1):
+        sub = {"name": f"{s['name']}_answer{k}", "photos": [s["photos"][i - 1] for i in g["photos"]],
+               "folder": None, "captions": [caps[i - 1] for i in g["photos"]]}
+        try:
+            res = process_set(ctx, sub, ask_on_low_confidence=False, read=g.get("read") or "group")
+        except FatalError:
+            raise
+        except UserError as e:
+            res = needs_review(ctx, sub, f"Notion problem: {e}")
+        except Exception as e:  # one answer must not stop the others
+            res = needs_review(ctx, sub, f"Unexpected error: {e.__class__.__name__}: {e}")
+        results.append((g["photos"], res))
+    return {"status": "multi", "results": results, "groups": len(groups)}
+
+
+def photo_range(nums):
+    nums = list(nums)
+    if not nums:
+        return ""
+    return f"photo {nums[0]}" if len(nums) == 1 else f"photos {nums[0]} to {nums[-1]}"
+
+
+def pending_start_block(today_str):
+    """Placed under the photos BEFORE the slow evaluation, so a crash or restart leaves the answer in the retry queue."""
+    return paragraph([("Evaluation pending: ", True),
+                      (f"Gemini started evaluating this answer on {today_str}. If no evaluation appears here, the bot "
+                       "will retry by itself (or send /retry to the bot).", False)])
+
+
+def process_set(ctx, s, link=None, ask_on_low_confidence=False, read=None):
     """Runs the whole pipeline for one answer set. Returns a result dict with 'status':
-    done, review (moved to needs_review), ambiguous (only with ask_on_low_confidence; nothing moved), dry."""
+    done, review (moved to needs_review), ambiguous (only with ask_on_low_confidence; nothing moved), dry,
+    multi (the set held several answers; see process_batch).
+    read: Gemini's reading of these photos when already known (one answer out of a split batch), or 'group'
+    for a split-off group whose question still has to be read (it is then never split again)."""
     cfg, log = ctx.cfg, ctx.log
     today = today_local()
     today_str = today.strftime("%d %b %Y")
@@ -1214,19 +1256,29 @@ def process_set(ctx, s, link=None, ask_on_low_confidence=False):
 
     ctx.databases()
     order = list(range(1, len(shrunk) + 1))
-    read = None
     gem = ctx.gemini() if ctx.evaluate else None
+    part_of_batch = read is not None
+    if read == "group":
+        read = None
 
-    # ---- 1. Gemini reads the photos (no Notion writes yet)
-    if gem and not link:
+    # ---- 1. Gemini reads the photos and splits a batch of several answers (no Notion writes yet)
+    if gem and not link and read is None:
         log("Gemini is reading the photos...")
         try:
             read = gem.read_answer(shrunk)
         except ge.GeminiKeyError as e:
             raise FatalError(str(e))
         except ge.GeminiError as e:
+            shutil.rmtree(work, ignore_errors=True)
             return needs_review(ctx, s, f"Gemini could not read the photos ({e}).")
-        order = ge.valid_order(read.get("page_order"), len(shrunk)) or order
+        if not part_of_batch and cfg.get("split_batches", True):
+            groups = ge.group_photos(read, len(shrunk), s.get("breaks") or ())
+            if len(groups) > 1:
+                shutil.rmtree(work, ignore_errors=True)
+                return process_batch(ctx, s, groups)
+        order = ge.repair_order(read.get("page_order"), len(shrunk))
+    elif read is not None:
+        order = ge.repair_order(read.get("page_order"), len(shrunk))
 
     # ---- 2. find the question
     top = None
@@ -1256,25 +1308,28 @@ def process_set(ctx, s, link=None, ask_on_low_confidence=False):
     log(f'Question ({q["label"]}): "{q["title"]}" ({reason})')
     out_of, eval_wl = marking(q)
 
-    # ---- 3. Gemini evaluates (still no Notion writes)
     ev, pending_why = None, None
-    if gem:
+    pending_first = bool(gem) and cfg.get("mark_pending_first", True) and cfg.get("upload_if_eval_fails", True)
+
+    def run_eval():
+        """Gemini evaluates the photos in reading order. Returns (evaluation or None, why it failed or None)."""
         log("Gemini is evaluating the answer...")
-        ordered_for_eval = [shrunk[i - 1] for i in order]
         try:
-            ev = gem.evaluate(ordered_for_eval, q["title"], q["years"], eval_wl, out_of,
-                              paper=q.get("paper"), topic=q.get("topic"))
-            if not read:
-                o2 = ge.valid_order(ev.get("page_order"), len(shrunk))
-                if o2:
-                    order = [order[i - 1] for i in o2]
+            got = gem.evaluate(ordered_for_eval, q["title"], q["years"], eval_wl, out_of,
+                               paper=q.get("paper"), topic=q.get("topic"))
         except ge.GeminiKeyError as e:
             raise FatalError(str(e))
         except ge.GeminiError as e:
-            pending_why = str(e)
-            if not cfg.get("upload_if_eval_fails", True):
-                return needs_review(ctx, s, f"Gemini could not evaluate the answer ({e}).")
-            log(f"  Evaluation failed ({e}). Uploading the photos with an 'Evaluation pending' line.")
+            log(f"  Evaluation failed ({e}). The answer stays 'Evaluation pending' for the retry.")
+            return None, str(e)
+        return got, None
+
+    # ---- 3. Gemini evaluates now only in the old mode; normally the photos are saved first (see 4b)
+    ordered_for_eval = [shrunk[i - 1] for i in order]
+    if gem and not pending_first:
+        ev, pending_why = run_eval()
+        if pending_why and not cfg.get("upload_if_eval_fails", True):
+            return needs_review(ctx, s, f"Gemini could not evaluate the answer ({pending_why}).")
 
     # ---- final names in reading order
     short = slugify(q["title"], 20).lower()
@@ -1290,17 +1345,44 @@ def process_set(ctx, s, link=None, ask_on_low_confidence=False):
 
     # ---- 4. Notion writes
     client = ctx.notion()
-    columns = ctx.columns(q["tracker"]) if (ev or pending_why) else set()
+    columns = ctx.columns(q["tracker"]) if (ev or pending_why or pending_first) else set()
     log("Uploading to Notion...")
     upload_ids = [client.upload_file(f) for f in processed]
     blocks = client.list_children(page_id)
     plan = plan_tracker_insert(blocks, today_str)
-    extra = evaluation_blocks(ev, today_str) if ev else ([pending_block(today_str, pending_why)] if pending_why else [])
+    if pending_first:
+        extra = [pending_start_block(today_str)]
+    else:
+        extra = evaluation_blocks(ev, today_str) if ev else ([pending_block(today_str, pending_why)] if pending_why else [])
     images = [image_block(u, c) for u, c in zip(upload_ids, captions)]
-    client.append_children(page_id, plan["header"] + images + extra, after=plan["after"])
+    added = client.append_children(page_id, plan["header"] + images + extra, after=plan["after"])
     if plan["placeholder"]:
         client.trash_block(plan["placeholder"])
     log("  photos" + (" and evaluation" if ev else "") + " added to the question page")
+
+    # ---- 4b. photos are safe in Notion and marked 'Evaluation pending': now the slow evaluation
+    if pending_first:
+        rk0 = cfg.get("gemini_remark_property", "Gemini Remark")
+        start_id = next((b.get("id") for b in (added or {}).get("results") or [] if is_pending_block(b)), None)
+        ctx.in_progress.add(plain_id(page_id))
+        try:
+            pre = {}
+            if rk0 in columns:  # the retry queue: if the server dies during the evaluation, the retry finds this row
+                pre[rk0] = {"rich_text": rich([(f"{PENDING_MARK} since {today_str}: evaluation started", False)])}
+            if pre:
+                client.update_page(page_id, pre, what="marking the answer as 'Evaluation pending'")
+            ordered_for_eval = list(processed)  # the same photos, already renamed in reading order
+            ev, pending_why = run_eval()
+        finally:
+            ctx.in_progress.discard(plain_id(page_id))
+        if ev:
+            client.append_children(page_id, evaluation_blocks(ev, today_str), after=start_id,
+                                   what="adding the evaluation")
+        else:
+            client.append_children(page_id, [pending_block(today_str, pending_why)], after=start_id,
+                                   what="adding the 'Evaluation pending' line")
+        if start_id:  # the bot's own placeholder line, never Avi's content
+            client.trash_block(start_id)
 
     props = {}
     if ev and ev.get("misread_demand") and cfg.get("status_when_misread"):
@@ -1531,7 +1613,10 @@ def evaluate_pending(ctx, q):
             shrink_image(raw, dst, int(cfg.get("max_long_side", 1800)), int(cfg.get("jpeg_quality", 85)), max_bytes)
             paths.append(dst)
         log(f'Retrying the evaluation of "{q["title"][:80]}" ({len(paths)} photo(s))')
+        others = 0
         try:
+            if len(paths) >= int(cfg.get("split_check_min_photos", 7)) and cfg.get("split_batches", True):
+                paths, others = answer_part_for(ctx, paths, q)
             ev = ctx.gemini().evaluate(paths, q["title"], q["years"], eval_wl, out_of,
                                        paper=q.get("paper"), topic=q.get("topic"))
         except ge.GeminiKeyError as e:
@@ -1583,15 +1668,34 @@ def evaluate_pending(ctx, q):
             except UserError as e:
                 log(f"  Remarks card skipped: {e}")
         return {"status": "done", "question": q, "page_url": page_url, "eval": ev, "pending": None,
-                "status_set": status, "proof": proof, "card_url": card, "retried": True}
+                "status_set": status, "proof": proof, "card_url": card, "retried": True, "other_answers": others}
     finally:
         shutil.rmtree(work, ignore_errors=True)
+
+
+def answer_part_for(ctx, paths, q):
+    """Many photos waiting on one page may be several answers that were sent together (before the bot could split
+    batches). Gemini reads them; only the group whose question matches this page is evaluated.
+    Returns (paths to evaluate, number of other answers seen). Nothing on the page is moved or deleted."""
+    read = ctx.gemini().read_answer(paths)
+    groups = ge.group_photos(read, len(paths))
+    if len(groups) < 2:
+        return paths, 0
+    best, best_sc = groups[0], -1.0
+    for g in groups:
+        sc = ge.similarity(g.get("question_written") or "", q["title"])
+        if sc > best_sc:
+            best, best_sc = g, sc
+    ctx.log(f"  the page holds {len(groups)} answers; evaluating {photo_range(best['photos'])} "
+            f"({best_sc:.0%} match with this question)")
+    return [paths[i - 1] for i in best["photos"]], len(groups) - 1
 
 
 def retry_pending(ctx, on_result=None, skip=None):
     """Evaluates every pending row, oldest first. Stops at the first 'Gemini busy or out of quota' failure.
     Returns dict(found, done, pending, stopped, failed, results)."""
-    rows = [q for q in find_pending(ctx) if not (skip and q["id"] in skip)]
+    busy = getattr(ctx, "in_progress", set())
+    rows = [q for q in find_pending(ctx) if not (skip and q["id"] in skip) and plain_id(q["id"]) not in busy]
     out = {"found": len(rows), "done": 0, "pending": len(rows), "stopped": None, "failed": [], "results": []}
     for q in rows:
         try:
