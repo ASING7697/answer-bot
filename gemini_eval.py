@@ -338,7 +338,7 @@ def group_photos(read, n, hard_breaks=()):
 
 
 class GeminiClient:
-    def __init__(self, api_key, model=DEFAULT_MODEL, fallbacks=None, timeout=180, retries=4,
+    def __init__(self, api_key, model=DEFAULT_MODEL, fallbacks=None, timeout=100, retries=4,
                  session=None, sleep=time.sleep, log=print, budget=None, clock=time.monotonic):
         self.key = (api_key or "").strip()
         self.models = [model] + [m for m in (fallbacks if fallbacks is not None else DEFAULT_FALLBACKS) if m != model]
@@ -390,8 +390,9 @@ class GeminiClient:
         def nap(sec):
             self.sleep(max(0, min(sec, left())))
 
-        for model in self.models:
+        for mi, model in enumerate(self.models):
             url = f"{GEMINI_API}/models/{model}:generateContent"
+            more = mi < len(self.models) - 1  # another model left to fall back to
             for attempt in range(self.retries):
                 if left() <= 5:
                     raise GeminiError(f"{what} took too long ({last}); it will be tried again later")
@@ -401,6 +402,9 @@ class GeminiClient:
                                     json=body, timeout=min(self.timeout, max(10, left())))
                 except requests.exceptions.RequestException as e:
                     last = self._redact(f"network problem: {e.__class__.__name__}")
+                    if more:  # a slow or overloaded model: the next model is usually quicker
+                        self.log(f"  {what}: {last}, trying the next model")
+                        break
                     self.log(f"  {what}: {last}, retrying in {wait} s")
                     nap(wait)
                     continue
@@ -438,6 +442,9 @@ class GeminiClient:
                     continue
                 if status >= 500:
                     last = f"Gemini server error {status}"
+                    if more and (attempt >= 1 or status == 503):  # overloaded: move on instead of waiting on this model
+                        self.log(f"  {what}: {last}, trying the next model")
+                        break
                     self.log(f"  {what}: {last}, retrying in {wait} s")
                     nap(wait)
                     continue

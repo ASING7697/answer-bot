@@ -29,6 +29,12 @@ import notion_attach as na
 import telegram_mode as tm
 
 
+
+# Show times in Avi's time zone (the Render server clock is UTC).
+os.environ.setdefault("TZ", "Asia/Kolkata")
+if hasattr(time, "tzset"):
+    time.tzset()
+
 def webhook_path(secret):
     """URL path segment derived from the secret, so the secret itself never shows in request logs."""
     return hashlib.sha256(("path:" + secret).encode()).hexdigest()[:32]
