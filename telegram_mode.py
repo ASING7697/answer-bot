@@ -507,7 +507,22 @@ class Listener:
                 shutil.rmtree(d, ignore_errors=True)
                 return
         try:
-            res = na.process_set(self.ctx, s, link=link, ask_on_low_confidence=True)
+            res = na.process_set(self.ctx, s, link=link, ask_on_low_confidence=True, keep_on_busy=True)
+        except na.GeminiBusy as e:
+            # Gemini is slow or out of quota. Keep the photos and try again soon (Render sleeps after
+            # 15 idle minutes, so retry within that window, at most 3 times).
+            tries = int(meta.get("busy_tries") or 0) + 1
+            if tries <= 3:
+                wait = [5, 10, 12][tries - 1] * 60
+                meta["busy_tries"] = tries
+                meta["retry_after"] = self.now() + wait
+                self.state.save(meta)
+                self.bot.send(chat, f"Gemini is busy right now ({str(e)[:150]}). Your photos are kept and I will "
+                                    f"try again at {time.strftime('%H:%M', time.localtime(meta['retry_after']))}.")
+                self.record_run({"result": "gemini busy", "error": str(e)})
+                return
+            res = na.needs_review(self.ctx, s, f"Gemini could not read the photos after several tries ({e}). "
+                                               "Please send them again later.")
         except na.FatalError as e:
             # A key or setup problem: keep the photos, tell Avi once, try again in 30 minutes.
             wait = float(self.ctx.cfg.get("retry_after_setup_error_minutes", 30)) * 60

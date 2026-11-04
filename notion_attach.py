@@ -1176,6 +1176,10 @@ class Context:
         return self._columns[tracker]
 
 
+class GeminiBusy(Exception):
+    """Gemini failed to read a set (timeout, rate limit). Nothing was written; the photos should be kept."""
+
+
 def needs_review(ctx, s, reason, top=None, work=None):
     stamp = _dt.datetime.now().strftime("%Y-%m-%d_%H%M")
     target = ctx.inbox / "needs_review" / f"{stamp}_{s['name']}"
@@ -1232,7 +1236,7 @@ def pending_start_block(today_str):
                        "will retry by itself (or send /retry to the bot).", False)])
 
 
-def process_set(ctx, s, link=None, ask_on_low_confidence=False, read=None):
+def process_set(ctx, s, link=None, ask_on_low_confidence=False, read=None, keep_on_busy=False):
     """Runs the whole pipeline for one answer set. Returns a result dict with 'status':
     done, review (moved to needs_review), ambiguous (only with ask_on_low_confidence; nothing moved), dry,
     multi (the set held several answers; see process_batch).
@@ -1274,6 +1278,8 @@ def process_set(ctx, s, link=None, ask_on_low_confidence=False, read=None):
             raise FatalError(str(e))
         except ge.GeminiError as e:
             shutil.rmtree(work, ignore_errors=True)
+            if keep_on_busy and not part_of_batch:
+                raise GeminiBusy(str(e))  # the listener keeps the photos and tries again later
             return needs_review(ctx, s, f"Gemini could not read the photos ({e}).")
         if not part_of_batch and cfg.get("split_batches", True):
             groups = ge.group_photos(read, len(shrunk), s.get("breaks") or ())
