@@ -38,6 +38,12 @@ GS rows in the proof log and Remarks have no "Tracker question" link (those link
 
 ## 2. Gemini says the daily limit is reached
 
+Upload-only mode (the default) uses Gemini only once per batch you send (one read for splitting, ordering,
+matching and the answer text, on small copies of the photos; one extra short text request only when the question
+match is unclear). There are no evaluation requests, so the free limit lasts far longer. The free per-minute and
+daily limits still apply to that one read. If it fails, the bot keeps your photos and tries again by itself in
+5, 10 and 12 minutes. The rest of this section is about evaluate mode (EVALUATE=on).
+
 The free plan has a daily limit. It resets at midnight US Pacific time (about 1:30 PM India time). Meanwhile the tool still attaches your pages, adds an "Evaluation pending" line and writes "Evaluation pending" in Gemini Remark. That Gemini Remark text is the waiting list, so do not edit it by hand.
 
 You do not need to do anything. Whenever you message the bot (any message, even "hi"), it tries the waiting answers in the background, oldest first, and stops as soon as Gemini is still busy. After a failure it waits at least 10 minutes before the next automatic try, then longer each time, so it never hammers Gemini. When an answer is evaluated, Notion is filled exactly as usual and the bot sends you the evaluation with the question.
@@ -117,7 +123,10 @@ The bot looks for databases named GS PYQs, Geography optional, Answers written a
 
 ## I sent several answers in one go
 
-That is fine. The bot reads every photo and starts a new answer wherever a new question is written at the top
-of a page, then attaches and evaluates each answer on its own question page. Any answer it cannot match is not
-attached anywhere; the bot lists those photo numbers so you can send them again on their own. To force a split,
-send the word `next` between two answers.
+That is fine, even if the pages are shuffled. The bot never groups photos by time or by the order they arrived.
+It waits only about 30 seconds of quiet so an album finishes arriving, then Gemini reads all the pages once and
+groups and orders them by content: a new question written at the top starts an answer, and pages whose sentences
+and headings continue each other are put after it. Each answer goes to its own question page. Any answer it cannot
+match, and any pages that look incomplete (a page clearly missing), are attached nowhere; the bot lists those
+photo numbers so you can send them again. To attach pages as they are, send them with the question's Notion link.
+To force a split in the order you sent, send the word `next` between two answers.

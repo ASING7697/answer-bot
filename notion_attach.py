@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 """
-Notion Photo Uploader (with Gemini evaluation) for Avi's UPSC PYQ tracker.
+Notion Photo Uploader for Avi's UPSC PYQ tracker.
+
+DEFAULT IS UPLOAD-ONLY (evaluate off): Gemini is used for ONE light read per batch, to split a batch of several
+answers, find each question and copy the handwriting as text. The photos and that text go under "My answer",
+Status is set to Done and Evaluated to "Not evaluated". No marks, no remarks, no Remarks card. Evaluation is done
+later by another AI (Grok, Gemini in anti-gravity, ChatGPT) from the Notion page.
+Turn the old automatic Gemini evaluation back on with EVALUATE=on (Render) or "evaluate": true (config.json).
+
+The steps below describe evaluate mode:
 
 One step: put the answer photos in answers_inbox and double-click run.bat.
   1. Gemini reads the photos: question text, reading order, what the answer covers.
@@ -13,7 +21,8 @@ One step: put the answer photos in answers_inbox and double-click run.bat.
   5. Copies the photos to your Google Drive folder, moves the originals to answers_inbox/done,
      and saves the evaluation as a .txt file next to them.
 
-Photo-only mode (no Gemini): --no-eval, or "evaluate": false in config.json.
+Upload-only mode (Gemini only reads): the default, or "evaluate": false in config.json, or EVALUATE=off.
+Photo-only mode (no Gemini at all): --no-eval.
 
 Usage:
   python notion_attach.py                      (finds the question by itself)
@@ -74,7 +83,12 @@ DEFAULT_CONFIG = {
     "notion_version": DEFAULT_NOTION_VERSION,
     "remarks_database_id": "7f9e63e326d24a24aba8771959de0eb9",
     "remarks_data_source_id": "68e1fafa-bba9-4298-a9c7-aa87a13d56c5",
-    "evaluate": True,
+    "evaluate": False,  # upload-only by default; EVALUATE=on or "evaluate": true brings the Gemini evaluation back
+    "gemini_read": True,  # Gemini reads the photos (split batches, find the question, transcribe): one call per batch
+    "save_answer_text": True,  # the same read call copies the handwriting; it is saved under the photos
+    "gemini_read_side": 1280,  # long side of the small copies Gemini reads (saves upload size and time)
+    "evaluated_property": "Evaluated",  # select column: Not evaluated / Evaluated
+    "hold_incomplete": True,  # pages that look incomplete (a page clearly missing) are attached nowhere
     "gemini_api_key": "PASTE_YOUR_GEMINI_KEY_HERE",
     "gemini_model": "gemini-3.8-flash",
     "gemini_fallback_models": ["gemini-3.6-flash", "gemini-3.5-flash-lite"],
@@ -96,7 +110,9 @@ DEFAULT_CONFIG = {
     "dedupe_with_notion": True,
     "telegram_bot_token": "PASTE_YOUR_TELEGRAM_BOT_TOKEN_HERE",
     "allowed_user_ids": [8308385292],
-    "telegram_set_gap_seconds": 60,
+    # Only a short quiet gap so a Telegram album finishes arriving. Photos are NEVER grouped into answers by time:
+    # every set is split by page content (a new question written at the top starts a new answer).
+    "telegram_set_gap_seconds": 30,
 }
 
 # Proof log Section to Remarks Section (Remarks has no "Indian Geography")
@@ -199,6 +215,10 @@ def load_config(path=None):
                     cfg[ds_key] = ""  # found from the database ID
     cfg["_env_roles"] = sorted(env_roles)
     cfg["_allowed_from_env"] = bool(env_ids)
+    for env, key in (("EVALUATE", "evaluate"), ("GEMINI_READ", "gemini_read"), ("SAVE_ANSWER_TEXT", "save_answer_text")):
+        val = os.environ.get(env)
+        if val is not None and val.strip():
+            cfg[key] = val.strip().lower() in ("1", "on", "true", "yes", "y")
     env_gem = os.environ.get("GEMINI_API_KEY")
     if env_gem:
         cfg["gemini_api_key"] = env_gem.strip()
@@ -411,13 +431,26 @@ class NotionClient:
             cursor = data.get("next_cursor")
 
     def append_children(self, block_id, children, after=None, what="adding the photos"):
-        body = {"children": children}
-        if after:
-            if self.version >= "2026-03-11":
-                body["position"] = {"type": "after_block", "after_block": {"id": after}}
-            else:
-                body["after"] = after
-        return self.request("PATCH", f"/blocks/{block_id}/children", what=what, json=body)
+        """Notion takes at most 100 blocks per request: longer lists go in pieces, each after the last one."""
+        out = None
+        children = list(children)
+        while True:
+            piece, children = children[:100], children[100:]
+            body = {"children": piece}
+            if after:
+                if self.version >= "2026-03-11":
+                    body["position"] = {"type": "after_block", "after_block": {"id": after}}
+                else:
+                    body["after"] = after
+            got = self.request("PATCH", f"/blocks/{block_id}/children", what=what, json=body)
+            if out is None:
+                out = got
+            elif isinstance(out, dict) and isinstance(got, dict):
+                out.setdefault("results", []).extend(got.get("results") or [])
+            if not children:
+                return out
+            last = ((got or {}).get("results") or [{}])[-1].get("id") if isinstance(got, dict) else None
+            after = last or after
 
     def trash_block(self, block_id):
         return self.request("DELETE", f"/blocks/{block_id}", what="removing the 'Images pending' line")
@@ -805,14 +838,38 @@ def find_databases(client, cfg, log=print):
     return found
 
 
-def ensure_gemini_columns(client, cfg, log=print, tracker="geo"):
-    """Create 'Gemini Marks' (number) and 'Gemini Remark' (text) on the tracker if missing.
-    Returns the set of column names that are safe to write (plus 'Date' if the tracker has a date column)."""
+EVALUATED_OPTIONS = ("Not evaluated", "Evaluated")
+
+
+def ensure_gemini_columns(client, cfg, log=print, tracker="geo", gemini=True):
+    """Create 'Gemini Marks' (number) and 'Gemini Remark' (text) on the tracker if missing (only when the bot
+    evaluates), and the 'Evaluated' select (Not evaluated / Evaluated). Returns the set of column names that are
+    safe to write (plus 'Date' if the tracker has a date column)."""
     ds = tracker_ds(client, cfg, tracker)
     schema = client.get_data_source(ds, what=f"the {TRACKER_KEYS[tracker][2]}'s columns").get("properties", {})
-    want = {cfg.get("gemini_marks_property", "Gemini Marks"): "number",
-            cfg.get("gemini_remark_property", "Gemini Remark"): "rich_text"}
+    want = {}
+    if gemini:
+        want = {cfg.get("gemini_marks_property", "Gemini Marks"): "number",
+                cfg.get("gemini_remark_property", "Gemini Remark"): "rich_text"}
     ok, missing = set(), {}
+    evp = cfg.get("evaluated_property", "Evaluated")
+    if evp:
+        col = schema.get(evp)
+        if col is None:
+            try:
+                client.add_properties(ds, {evp: {"select": {"options": [
+                    {"name": EVALUATED_OPTIONS[0], "color": "gray"}, {"name": EVALUATED_OPTIONS[1], "color": "green"}]}}},
+                    what=f"creating the '{evp}' column")
+                log(f"  Created tracker column: {evp}")
+                ok.add(evp)
+            except FatalError:
+                raise
+            except UserError as e:  # never block an upload over this marker
+                log(f"  could not create the '{evp}' column ({str(e).splitlines()[0]}); add it by hand")
+        elif col.get("type") == "select":
+            ok.add(evp)
+        else:
+            log(f"  WARNING: column '{evp}' exists but is not a select column, so it is skipped.")
     for name, typ in want.items():
         if name in schema:
             if schema[name].get("type") == typ:
@@ -840,6 +897,40 @@ def evaluation_blocks(ev, today_str):
     blocks.append(heading3("Mistakes to fix"))
     blocks += [numbered([(m["point"] + ": ", True), (m["detail"], False)]) for m in ev["mistakes"]]
     return blocks
+
+
+ANSWER_TEXT_HEADING = "Answer text"
+
+
+def answer_text_blocks(texts, today_str, model=None):
+    """The handwriting Gemini copied in the same read call, under the photos, so an AI that cannot see images
+    (ChatGPT, for example) can still evaluate the answer. One heading, then the text of each page.
+    Notion allows 2000 characters per text piece and 100 blocks per request, so long pages are split."""
+    pages = [(i, (t or "").strip()) for i, t in enumerate(texts, 1)]
+    pages = [(i, t) for i, t in pages if t]
+    if not pages:
+        return []
+    by = f", read by Gemini ({model})" if model else ", read by Gemini"
+    blocks = [heading3(f"{ANSWER_TEXT_HEADING} ({today_str}{by})"),
+              paragraph([("Transcribed from the photos above for evaluation by text. Check the photos where it "
+                          "says [unclear].", False)])]
+    for i, t in pages:
+        blocks.append(paragraph([(f"Page {i}", True)]))
+        chunk = ""
+        for line in t.splitlines() or [t]:
+            while len(line) > 1900:
+                if chunk:
+                    blocks.append(paragraph([(chunk, False)]))
+                    chunk = ""
+                blocks.append(paragraph([(line[:1900], False)]))
+                line = line[1900:]
+            if len(chunk) + len(line) + 1 > 1900:
+                blocks.append(paragraph([(chunk, False)]))
+                chunk = ""
+            chunk = f"{chunk}\n{line}" if chunk else line
+        if chunk:
+            blocks.append(paragraph([(chunk, False)]))
+    return blocks[:300]
 
 
 def pending_block(today_str, why):
@@ -1093,7 +1184,10 @@ class Context:
         inbox = Path(args.folder) if args.folder else Path(cfg["inbox_folder"])
         self.inbox = inbox if inbox.is_absolute() else SCRIPT_DIR / inbox
         self.inbox.mkdir(parents=True, exist_ok=True)
-        self.evaluate = bool(cfg.get("evaluate", True)) and not args.no_eval
+        self.evaluate = bool(cfg.get("evaluate", False)) and not args.no_eval
+        # Gemini READS the photos (split, match, transcribe) even when it does not evaluate. --no-eval means no
+        # Gemini at all (photo-only, needs the question link).
+        self.read_with_gemini = not args.no_eval and (self.evaluate or bool(cfg.get("gemini_read", True)))
         self.client = client
         self.gem = gem
         self.http = None  # session used to download photos back from Notion (tests put a fake here)
@@ -1170,9 +1264,16 @@ class Context:
             self._rows, self._rows_at = rows, time.time()
         return self._rows
 
+    def uses_gemini(self):
+        """True when Gemini reads the photos: always in evaluate mode; in upload-only mode when a key is set."""
+        if not self.read_with_gemini:
+            return False
+        return self.evaluate or self.gem is not None or gemini_key_ok(self.cfg.get("gemini_api_key", ""))
+
     def columns(self, tracker="geo"):
         if tracker not in self._columns:
-            self._columns[tracker] = ensure_gemini_columns(self.notion(), self.cfg, self.log, tracker)
+            self._columns[tracker] = ensure_gemini_columns(self.notion(), self.cfg, self.log, tracker,
+                                                           gemini=self.evaluate)
         return self._columns[tracker]
 
 
@@ -1210,6 +1311,9 @@ def process_batch(ctx, s, groups):
     for k, g in enumerate(groups, 1):
         sub = {"name": f"{s['name']}_answer{k}", "photos": [s["photos"][i - 1] for i in g["photos"]],
                "folder": None, "captions": [caps[i - 1] for i in g["photos"]]}
+        if g.get("incomplete") and ctx.cfg.get("hold_incomplete", True):
+            results.append((g["photos"], needs_review(ctx, sub, incomplete_reason(g))))
+            continue
         try:
             res = process_set(ctx, sub, ask_on_low_confidence=False, read=g.get("read") or "group")
         except FatalError:
@@ -1223,10 +1327,22 @@ def process_batch(ctx, s, groups):
 
 
 def photo_range(nums):
+    """'photo 3', 'photos 1 to 4' (a run sent in order) or 'photos 4, 1, 3' (reading order of shuffled photos)."""
     nums = list(nums)
     if not nums:
         return ""
-    return f"photo {nums[0]}" if len(nums) == 1 else f"photos {nums[0]} to {nums[-1]}"
+    if len(nums) == 1:
+        return f"photo {nums[0]}"
+    if nums == list(range(nums[0], nums[0] + len(nums))):
+        return f"photos {nums[0]} to {nums[-1]}"
+    return "photos " + ", ".join(str(x) for x in nums)
+
+
+def incomplete_reason(g):
+    return (f"{photo_range(g['photos']).capitalize()} look incomplete"
+            + (f" ({g['note'].rstrip('.')})" if g.get("note") else "")
+            + ", so I attached them nowhere. Send the whole answer again, or add the question's Notion link "
+              "to attach these pages as they are")
 
 
 def pending_start_block(today_str):
@@ -1264,16 +1380,20 @@ def process_set(ctx, s, link=None, ask_on_low_confidence=False, read=None, keep_
 
     ctx.databases()
     order = list(range(1, len(shrunk) + 1))
-    gem = ctx.gemini() if ctx.evaluate else None
+    gem = ctx.gemini() if ctx.uses_gemini() else None
+    evaluate = ctx.evaluate and gem is not None
+    transcribe = bool(cfg.get("save_answer_text", True))
+    read_side = cfg.get("gemini_read_side", ge.READ_SIDE)
     part_of_batch = read is not None
     if read == "group":
         read = None
 
-    # ---- 1. Gemini reads the photos and splits a batch of several answers (no Notion writes yet)
+    # ---- 1. Gemini reads the photos and splits a batch of several answers (no Notion writes yet).
+    # ONE request per batch: the split, every question and the handwriting text all come from this call.
     if gem and not link and read is None:
         log("Gemini is reading the photos...")
         try:
-            read = gem.read_answer(shrunk)
+            read = gem.read_answer(shrunk, transcribe=transcribe, side=read_side)
         except ge.GeminiKeyError as e:
             raise FatalError(str(e))
         except ge.GeminiError as e:
@@ -1281,12 +1401,19 @@ def process_set(ctx, s, link=None, ask_on_low_confidence=False, read=None, keep_
             if keep_on_busy and not part_of_batch:
                 raise GeminiBusy(str(e))  # the listener keeps the photos and tries again later
             return needs_review(ctx, s, f"Gemini could not read the photos ({e}).")
+        order = ge.repair_order(read.get("page_order"), len(shrunk))
         if not part_of_batch and cfg.get("split_batches", True):
             groups = ge.group_photos(read, len(shrunk), s.get("breaks") or ())
             if len(groups) > 1:
                 shutil.rmtree(work, ignore_errors=True)
                 return process_batch(ctx, s, groups)
-        order = ge.repair_order(read.get("page_order"), len(shrunk))
+            g = groups[0]
+            if "incomplete" in g:  # grouped and ordered by content: shuffled photos are fine
+                if g["incomplete"] and cfg.get("hold_incomplete", True):
+                    shutil.rmtree(work, ignore_errors=True)
+                    return needs_review(ctx, s, incomplete_reason(g))
+                if sorted(g["photos"]) == list(range(1, len(shrunk) + 1)):
+                    order = list(g["photos"])
     elif read is not None:
         order = ge.repair_order(read.get("page_order"), len(shrunk))
 
@@ -1319,7 +1446,7 @@ def process_set(ctx, s, link=None, ask_on_low_confidence=False, read=None, keep_
     out_of, eval_wl = marking(q)
 
     ev, pending_why = None, None
-    pending_first = bool(gem) and cfg.get("mark_pending_first", True) and cfg.get("upload_if_eval_fails", True)
+    pending_first = evaluate and cfg.get("mark_pending_first", True) and cfg.get("upload_if_eval_fails", True)
 
     def run_eval():
         """Gemini evaluates the photos in reading order. Returns (evaluation or None, why it failed or None)."""
@@ -1336,7 +1463,9 @@ def process_set(ctx, s, link=None, ask_on_low_confidence=False, read=None, keep_
 
     # ---- 3. Gemini evaluates now only in the old mode; normally the photos are saved first (see 4b)
     ordered_for_eval = [shrunk[i - 1] for i in order]
-    if gem and not pending_first:
+    texts_sent = ge.photo_texts(read, len(shrunk)) if (transcribe and read) else [""] * len(shrunk)
+    answer_texts = [texts_sent[i - 1] for i in order]
+    if evaluate and not pending_first:
         ev, pending_why = run_eval()
         if pending_why and not cfg.get("upload_if_eval_fails", True):
             return needs_review(ctx, s, f"Gemini could not evaluate the answer ({pending_why}).")
@@ -1355,7 +1484,13 @@ def process_set(ctx, s, link=None, ask_on_low_confidence=False, read=None, keep_
 
     # ---- 4. Notion writes
     client = ctx.notion()
-    columns = ctx.columns(q["tracker"]) if (ev or pending_why or pending_first) else set()
+    try:
+        columns = ctx.columns(q["tracker"])
+    except FatalError:
+        raise
+    except UserError as e:  # the photos matter more than the markers
+        log(f"  could not read the tracker columns ({str(e).splitlines()[0]})")
+        columns = set()
     log("Uploading to Notion...")
     upload_ids = [client.upload_file(f) for f in processed]
     blocks = client.list_children(page_id)
@@ -1365,10 +1500,12 @@ def process_set(ctx, s, link=None, ask_on_low_confidence=False, read=None, keep_
     else:
         extra = evaluation_blocks(ev, today_str) if ev else ([pending_block(today_str, pending_why)] if pending_why else [])
     images = [image_block(u, c) for u, c in zip(upload_ids, captions)]
-    added = client.append_children(page_id, plan["header"] + images + extra, after=plan["after"])
+    text_blocks = answer_text_blocks(answer_texts, today_str, getattr(gem, "used_model", None)) if transcribe else []
+    added = client.append_children(page_id, plan["header"] + images + text_blocks + extra, after=plan["after"])
     if plan["placeholder"]:
         client.trash_block(plan["placeholder"])
-    log("  photos" + (" and evaluation" if ev else "") + " added to the question page")
+    log("  photos" + (" and answer text" if text_blocks else "") + (" and evaluation" if ev else "")
+        + " added to the question page")
 
     # ---- 4b. photos are safe in Notion and marked 'Evaluation pending': now the slow evaluation
     if pending_first:
@@ -1405,6 +1542,9 @@ def process_set(ctx, s, link=None, ask_on_low_confidence=False, read=None, keep_
         props["Status"] = {"status": {"name": status}}
     if "Date" in columns:
         props["Date"] = {"date": {"start": today.isoformat()}}
+    evp = cfg.get("evaluated_property", "Evaluated")
+    if evp and evp in columns:  # new photos always need an evaluation, even on a page evaluated before
+        props[evp] = {"select": {"name": EVALUATED_OPTIONS[1] if ev else EVALUATED_OPTIONS[0]}}
     if ev:
         mk, rk = cfg.get("gemini_marks_property", "Gemini Marks"), cfg.get("gemini_remark_property", "Gemini Remark")
         if mk in columns:
@@ -1420,7 +1560,8 @@ def process_set(ctx, s, link=None, ask_on_low_confidence=False, read=None, keep_
             props[rk] = {"rich_text": rich([(f"{PENDING_MARK} since {today_str}: {pending_why}"[:1990], False)])}
     if props:
         client.update_page(page_id, props, what="updating Status and Gemini columns")
-        log(f"  Status: {status}" + (f", Gemini Marks: {fmt_score(ev['score'])}/{out_of}" if ev else ""))
+        log(f"  Status: {status}" + (f", Gemini Marks: {fmt_score(ev['score'])}/{out_of}" if ev else "")
+            + (f", {evp}: {props[evp]['select']['name']}" if evp in props else ""))
 
     proof = None
     if cfg.get("update_proof_log", True) and role_set(cfg, "proof"):
@@ -1481,7 +1622,8 @@ def process_set(ctx, s, link=None, ask_on_low_confidence=False, read=None, keep_
     return {"status": "done", "question": q, "page_url": page_url, "eval": ev, "pending": pending_why,
             "status_set": status, "proof": proof, "card_url": card, "done_dir": str(done_dir),
             "drive_dir": str(drive_dir) if drive_dir else None, "match_reason": reason,
-            "gpt_note": files.get("chatgpt_note.txt")}
+            "gpt_note": files.get("chatgpt_note.txt"), "upload_only": not ctx.evaluate, "photos": len(processed),
+            "answer_text": bool(text_blocks), "evaluated_set": (props.get(evp) or {}).get("select", {}).get("name")}
 
 
 # ----------------------------------------------------------------- retrying pending evaluations
@@ -1653,6 +1795,9 @@ def evaluate_pending(ctx, q):
             if not remark.lower().startswith("score"):
                 remark = f"Score: {fmt_score(ev['score'])}/{out_of}. " + remark
             props[rk] = {"rich_text": rich([(remark[:1990], False)])}
+        evp = cfg.get("evaluated_property", "Evaluated")
+        if evp and evp in columns:
+            props[evp] = {"select": {"name": EVALUATED_OPTIONS[1]}}
         client.update_page(page_id, props, what="updating Status and Gemini columns")
 
         proof = None
@@ -1687,7 +1832,7 @@ def answer_part_for(ctx, paths, q):
     """Many photos waiting on one page may be several answers that were sent together (before the bot could split
     batches). Gemini reads them; only the group whose question matches this page is evaluated.
     Returns (paths to evaluate, number of other answers seen). Nothing on the page is moved or deleted."""
-    read = ctx.gemini().read_answer(paths)
+    read = ctx.gemini().read_answer(paths, side=ctx.cfg.get("gemini_read_side", ge.READ_SIDE))
     groups = ge.group_photos(read, len(paths))
     if len(groups) < 2:
         return paths, 0
@@ -1766,7 +1911,7 @@ def rearrange_page(ctx, page_id):
         for bid in to_remove:  # only photos already attached on their right page
             client.trash_block(bid)
         out["removed"] = len(to_remove)
-        if pending_id:
+        if pending_id and ctx.evaluate:
             try:
                 res = evaluate_pending(ctx, {"id": page_id, "tracker": q.get("tracker")})
                 out["own"], out["own_status"] = res, "evaluated" if res.get("status") == "done" else res.get("status")
@@ -1881,14 +2026,16 @@ def check_setup(ctx):
                        ("remarks_database_id", "Remarks")):
         db = client.get_database(cfg[key], what=f"the {label} database")
         print(f"  {label}: connected ({rich_text_plain(db.get('title'))})")
-    if ctx.evaluate:
+    if ctx.uses_gemini():
         try:
             model = ctx.gemini().check()
             print(f"Gemini key works. Model: {model}")
         except ge.GeminiError as e:
             raise FatalError(str(e))
+        print("Gemini evaluation is " + ("ON." if ctx.evaluate else
+              "OFF (upload-only: Gemini only reads the photos, one call per batch)."))
     else:
-        print("Gemini evaluation is switched off (photo-only mode).")
+        print("Gemini is switched off (photo-only mode).")
     tg = (cfg.get("telegram_bot_token") or "").strip()
     if tg and not tg.startswith("PASTE_"):
         import telegram_mode
@@ -1912,7 +2059,7 @@ def main(argv=None, client=None, gem=None):
     ap.add_argument("--config", help="path to config.json")
     ap.add_argument("--watch", action="store_true", help="keep running and process new photos as they arrive")
     ap.add_argument("--telegram", action="store_true", help="listen to your Telegram bot for answer photos")
-    ap.add_argument("--no-eval", action="store_true", help="photo-only mode: no Gemini, prints a ChatGPT note")
+    ap.add_argument("--no-eval", action="store_true", help="photo-only mode: no Gemini at all, prints a ChatGPT note")
     ap.add_argument("--dry-run", action="store_true", help="shrink photos only, no Gemini and no Notion")
     ap.add_argument("--check", action="store_true", help="test the Notion and Gemini keys and connections")
     args = ap.parse_args(argv)

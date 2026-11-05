@@ -86,6 +86,8 @@ Telegram allows either Render (webhook) or the PC (polling), never both.
 ## Optional settings
 
 - **ALLOWED_USER_IDS**: who may use the bot, Telegram IDs separated by commas. Send /myid to the bot to see yours.
+- **EVALUATE**: off by default (upload-only: photos, answer text, Status Done, Evaluated "Not evaluated"). Set it to on to have Gemini evaluate every answer again.
+- **SAVE_ANSWER_TEXT**: on by default. Off stops saving the handwriting as text (the read reply gets shorter).
 - **AUTO_WEBHOOK**: off stops the service from connecting Telegram by itself when it starts.
 - **GS_TRACKER_DATABASE_ID, TRACKER_DATABASE_ID, PROOF_LOG_DATABASE_ID, REMARKS_DATABASE_ID**: only needed if the bot cannot find a database by its name. The value off switches that database off.
 

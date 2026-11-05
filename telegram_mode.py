@@ -177,11 +177,11 @@ class State:
 HELP = ("Commands: /status checks every key and shows the last run; /test is a dry run that writes nothing; "
         "/retry evaluates answers that are still waiting because Gemini was busy; /myid shows your Telegram ID.\n"
         "Send me the photos of one answer (as photos or, for best quality, as files). "
-        "I group photos sent within a minute into one set, or send 'done' to finish a set straight away. "
-        "You can send several answers in one go: I split them by where a new question is written at the top "
-        "of a page. To force a split, send 'next' between two answers. If one page got several answers by "
-        "mistake, send /rearrange followed by its Notion link. "
-        "I will find the question, attach the pages, evaluate with Gemini and fill Notion.")
+        "Send 'done' to finish a set straight away. "
+        "You can send several answers in one go, in any mix: I split them by page content (a new question written "
+        "at the top of a page starts a new answer), never by time. To force a split, send 'next' between two answers. "
+        "I find each question, attach its pages under My answer, save the answer text, and set Status Done and "
+        "Evaluated 'Not evaluated'. I do not evaluate (upload-only), so another AI can evaluate from Notion later.")
 
 
 def best_file(msg):
@@ -300,7 +300,7 @@ class Listener:
         self.log = log
         self.now = now
         self.allowed = {int(x) for x in cfg.get("allowed_user_ids") or []}
-        self.gap = float(cfg.get("telegram_set_gap_seconds", 60))
+        self.gap = float(cfg.get("telegram_set_gap_seconds", 30))
         token = (cfg.get("telegram_bot_token") or "").strip()
         if bot is None:
             if not token or token.startswith("PASTE_"):
@@ -352,11 +352,9 @@ class Listener:
         if f:
             file_id, ext, unique_id = f
             group = msg.get("media_group_id")
+            # Time never decides which photos belong to one answer: a photo joins the open set, and the set is
+            # split by page content (question written at the top) when it is processed.
             cur = self.open_set(chat_id)
-            if cur and not (group and group in cur["media_groups"]) and date - cur["last_date"] > self.gap:
-                cur["status"] = "ready"
-                self.state.save(cur)
-                cur = None
             if cur is None:
                 cur = self.state.new_set(chat_id, date)
             cur["count"] += 1
@@ -441,7 +439,7 @@ class Listener:
             elif r == "busy":
                 self.bot.send(chat_id, "I am already evaluating the waiting answers. Results will come here.")
             elif r == "off":
-                self.bot.send(chat_id, "Gemini is switched off, so there is nothing to retry.")
+                self.bot.send(chat_id, "Evaluation is switched off (upload-only mode), so there is nothing to retry.")
             return
         if low in ("/test", "test"):
             self.bot.send(chat_id, self.test_report(chat_id))
@@ -631,12 +629,14 @@ class Listener:
             lines += self.database_lines(client)
         except na.UserError as e:
             lines.append("Notion key: FAILED. " + str(e))
-        if self.ctx.evaluate:
+        if self.ctx.uses_gemini():
             try:
                 model = self.ctx.gemini().check()
                 lines.append(f"Gemini key: OK (model {model})")
             except (na.UserError, na.ge.GeminiError) as e:
                 lines.append("Gemini key/model: FAILED. " + str(e))
+            lines.append("Evaluation: ON (Gemini marks every answer)" if self.ctx.evaluate else
+                         "Evaluation: OFF (upload-only; Gemini only reads each batch once to split, match and copy the text)")
         else:
             lines.append("Gemini: switched off (photo-only mode)")
         return lines
@@ -716,7 +716,7 @@ class Listener:
             lines.append("Tracker questions: FAILED. " + str(e))
             return "\n".join(lines)
         cur = self.open_set(chat_id) or next((m for m in self.state.sets() if m["chat_id"] == chat_id), None)
-        if not cur or not self.ctx.evaluate:
+        if not cur or not self.ctx.uses_gemini():
             lines.append("To test question matching too: send the answer photos, then /test within a minute.")
             return "\n".join(lines)
         photos = na.list_photos(cur["_dir"], "name")
@@ -726,7 +726,7 @@ class Listener:
             for i, p in enumerate(photos, 1):
                 na.shrink_image(p, tmpdir / f"t{i}.jpg")
                 shrunk.append(tmpdir / f"t{i}.jpg")
-            read = self.ctx.gemini().read_answer(shrunk)
+            read = self.ctx.gemini().read_answer(shrunk, side=self.ctx.cfg.get("gemini_read_side", na.ge.READ_SIDE))
             cand, reason, top = na.choose_question(self.ctx.cfg, self.ctx.gemini(), read, rows, log=lambda *a: None)
             lines.append(f'Question read from {len(photos)} photo(s): "{read.get("question_written") or read.get("question_guess")}"')
             lines.append(f'Would attach to: "{cand["title"]}" in {cand.get("label") or "Geography optional"} ({reason})'
@@ -784,6 +784,15 @@ def result_messages(res):
     where = ", ".join(x for x in [q.get("label") or "Geography optional", years, f"{wl or '?'} words"] if x)
     head = [f'Matched question ({where}):\n"{q["title"]}"']
     msgs = []
+    if res.get("upload_only") and not ev:
+        n = res.get("photos") or 0
+        line = f"Attached {n} page{'s' if n != 1 else ''}. Status: {res.get('status_set')}"
+        if res.get("evaluated_set"):
+            line += f", Evaluated: {res['evaluated_set']}"
+        head.append(line + ".")
+        head.append("Answer text saved under the photos." if res.get("answer_text") else "No answer text saved (only photos).")
+        head.append(f"Notion: {res['page_url']}")
+        return ["\n".join(head)]
     if ev:
         head.append(f"Marks: {na.fmt_score(ev['score'])} / {na.fmt_score(ev['out_of'])} (Gemini)")
         head.append(f"Status: {res.get('status_set')}")

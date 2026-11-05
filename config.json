@@ -5,7 +5,7 @@
   "allowed_user_ids": [
     8308385292
   ],
-  "telegram_set_gap_seconds": 60,
+  "telegram_set_gap_seconds": 30,
   "tracker_database_id": "f051f0c54ccc8340ae6281b044b2e5da",
   "tracker_data_source_id": "e091f0c5-4ccc-8231-b554-070a930b6c20",
   "proof_log_database_id": "c46cec3441814d9194432652c73ec675",
@@ -16,7 +16,11 @@
   "inbox_folder": "answers_inbox",
   "set_gap_seconds": 60,
   "order_by": "name",
-  "evaluate": true,
+  "evaluate": false,
+  "gemini_read": true,
+  "save_answer_text": true,
+  "gemini_read_side": 1280,
+  "evaluated_property": "Evaluated",
   "gemini_model": "gemini-3.8-flash",
   "gemini_fallback_models": [
     "gemini-3.6-flash",

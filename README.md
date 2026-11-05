@@ -1,6 +1,11 @@
 # answer-bot
 
-A Telegram bot for UPSC answer writing. Send photos of a handwritten answer, and it finds the question in your Notion trackers ("GS PYQs" and/or "Geography optional"), attaches the pages, has Gemini evaluate the answer like a strict examiner, and fills Notion with the marks and remarks.
+A Telegram bot for UPSC answer writing. Send photos of a handwritten answer, and it finds the question in your Notion trackers ("GS PYQs" and/or "Geography optional"), attaches the pages under "My answer", saves the handwriting as text, and sets Status to Done and Evaluated to "Not evaluated".
+
+By default it does NOT evaluate (upload-only). Gemini only reads each batch once: to split several answers (even
+shuffled pages), put the pages in reading order, find each question and copy the handwriting. You then evaluate
+from Notion with any AI (Grok, Gemini, ChatGPT can use the saved answer text). To have Gemini evaluate and write
+marks and remarks again, set `EVALUATE` to `on` on Render (or `"evaluate": true` in config.json).
 
 Everything it uses is free: Telegram, Notion, Gemini (Google AI Studio) and Render.
 

@@ -163,6 +163,7 @@ class WebhookService:
 
     def health(self):
         return {"ok": True, "service": "notion-photo-uploader", "owner_set": bool(self.listener.allowed),
+                "evaluate": bool(self.listener.ctx.evaluate),
                 "queued": self.q.qsize(),
                 "open_sets": len(self.listener.state.sets()), "sets_processed": self.processed,
                 "last_error": self.last_error}

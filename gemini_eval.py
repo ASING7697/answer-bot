@@ -68,9 +68,26 @@ _PHOTO = {
     "required": ["photo", "starts_new_answer", "question_at_top", "first_words"],
 }
 
+_PHOTO_TEXT = {"type": "STRING", "description": (
+    "Everything handwritten on this photo, transcribed word for word in reading order (headings, points, "
+    "labels). Keep line breaks between points. Write [diagram: what it shows] for a diagram or map, and "
+    "[unclear] for a word you cannot read. Do not correct or improve the answer.")}
+
+_ANSWER = {
+    "type": "OBJECT",
+    "properties": {
+        "question_written": {"type": "STRING", "description": "The question written at the top of this answer's first page, copied exactly, or empty string if none is written."},
+        "photos": {"type": "ARRAY", "items": {"type": "INTEGER"}, "description": "Photo numbers of this answer in correct READING order (decided from the content, not from the order sent)."},
+        "looks_complete": {"type": "BOOLEAN", "description": "False only if a page is clearly missing: the first page has no question and starts mid-sentence, or the last page stops mid-sentence or mid-point with no page that continues it."},
+        "note": {"type": "STRING", "description": "If looks_complete is false: one short sentence saying what seems missing. Otherwise empty."},
+    },
+    "required": ["question_written", "photos", "looks_complete", "note"],
+}
+
 READ_SCHEMA = {
     "type": "OBJECT",
     "properties": {
+        "answers": {"type": "ARRAY", "items": _ANSWER, "description": "Every separate answer in the batch, each photo in exactly one answer."},
         "photos": {"type": "ARRAY", "items": _PHOTO, "description": "One entry for EVERY photo, in the order given."},
         "question_written": {"type": "STRING", "description": "The exam question exactly as written on the pages, or empty string if no question is written."},
         "question_guess": {"type": "STRING", "description": "If no question is written: one sentence describing what question this answer seems to address. Otherwise repeat the written question."},
@@ -78,8 +95,18 @@ READ_SCHEMA = {
         "answer_summary": {"type": "STRING", "description": "Short summary of what the (first) answer covers (main headings, thinkers, diagrams), under 120 words."},
         "legible": {"type": "BOOLEAN"},
     },
-    "required": ["photos", "question_written", "question_guess", "page_order", "answer_summary", "legible"],
+    "required": ["answers", "photos", "question_written", "question_guess", "page_order", "answer_summary", "legible"],
 }
+
+
+def read_schema(transcribe=False):
+    """READ_SCHEMA, optionally with a word-for-word transcription of every photo (same single request)."""
+    if not transcribe:
+        return READ_SCHEMA
+    photo = dict(_PHOTO, properties=dict(_PHOTO["properties"], text=_PHOTO_TEXT),
+                 required=_PHOTO["required"] + ["text"])
+    photos = dict(READ_SCHEMA["properties"]["photos"], items=photo)
+    return dict(READ_SCHEMA, properties=dict(READ_SCHEMA["properties"], photos=photos))
 
 PICK_SCHEMA = {
     "type": "OBJECT",
@@ -131,10 +158,22 @@ READ_SYSTEM = (
     "question, sometimes with the year or word limit); a photo that carries on the sentences, headings or "
     "diagrams of the previous photo is a continuation. For EVERY photo, fill one entry in 'photos': "
     "starts_new_answer, the question at its top copied exactly (empty for continuations) and its first words. "
-    "Photo 1 always starts an answer. Do not merge two different questions into one answer. "
+    "The photos may be SHUFFLED (the camera or Telegram can change their order), so never trust the order sent: "
+    "group and order them purely from the content (the question at the top of a first page, then pages whose "
+    "sentences, numbering, headings and diagrams continue each other). List every answer in 'answers' with its "
+    "photos in reading order; every photo goes in exactly one answer. Set looks_complete to false only when a "
+    "page is clearly missing (a first page without its question that starts mid-sentence, or a last page that "
+    "stops mid-sentence with no page continuing it). A short or weak answer is still complete. "
+    "Do not merge two different questions into one answer. "
     "question_written, question_guess and answer_summary describe the FIRST answer. page_order lists all photo "
     "numbers in reading order (keep the given order unless the photos of a single answer are clearly shuffled). "
     + STYLE_RULES
+)
+
+READ_TRANSCRIBE = (
+    " Also fill 'text' for every photo: a faithful word-for-word transcription of the handwriting on that photo, "
+    "so the answer can be evaluated later from text alone. Copy the student's words exactly, even mistakes; "
+    "the plain-English style rules above apply only to your own descriptions, not to this transcription."
 )
 
 EVAL_SYSTEM = """You are a strict, honest UPSC Civil Services examiner for Geography Optional, acting as Avi's answer evaluator.
@@ -231,6 +270,7 @@ def top_matches(query, candidates, n=5):
 
 MAX_INLINE_BYTES = 12 * 1024 * 1024  # photos per Gemini request (base64 adds a third; Gemini's limit is about 20 MB)
 READ_SIDE = 1280  # long side of the copies used only to read and split a batch (enough for handwriting)
+TRANSCRIBE_MAX_PHOTOS = 16  # bigger batches are read without transcription so the one reply stays fast
 
 
 def _b64(path):
@@ -283,12 +323,69 @@ def repair_order(order, n):
     return out + [k for k in range(1, n + 1) if k not in seen]
 
 
+def _content_groups(read, n):
+    """Groups from Gemini's 'answers' list (content based, so shuffled photos are fine). Every photo ends up in
+    exactly one group; photos Gemini placed nowhere (or twice) form an extra group marked incomplete.
+    Returns None when the reply has no usable 'answers' list."""
+    answers = (read or {}).get("answers")
+    if not isinstance(answers, list) or not answers:
+        return None
+    used, groups = set(), []
+    for a in answers:
+        if not isinstance(a, dict):
+            continue
+        nums = []
+        for x in a.get("photos") or []:
+            try:
+                k = int(x)
+            except (TypeError, ValueError):
+                continue
+            if 1 <= k <= n and k not in used:
+                used.add(k)
+                nums.append(k)
+        if not nums:
+            continue
+        complete = a.get("looks_complete") is not False
+        groups.append({"photos": nums, "question_written": clean_text((a.get("question_written") or "").strip()),
+                       "incomplete": not complete, "note": clean_text(a.get("note") or "") if not complete else ""})
+    if not groups:
+        return None
+    left = [k for k in range(1, n + 1) if k not in used]
+    if left:
+        groups.append({"photos": left, "question_written": "", "incomplete": True,
+                       "note": "Gemini could not tell which answer these pages belong to."})
+    return groups
+
+
 def group_photos(read, n, hard_breaks=()):
     """Splits a batch of n photos into separate answers, keeping the order they were sent.
     read: the reply of read_answer (its 'photos' list says where a new question starts).
     hard_breaks: photo numbers where Avi forced a new answer (he sent 'next' between photos).
     Returns a list of dicts: photos (1-based numbers), question_written, read (a read_answer style dict or None
     when the question is not known and the group has to be read on its own)."""
+    texts_by = {}
+    for e in (read or {}).get("photos") or []:
+        try:
+            texts_by.setdefault(int(e.get("photo")), e.get("text") or "")
+        except (TypeError, ValueError, AttributeError):
+            pass
+    content = None if hard_breaks else _content_groups(read, n)  # 'next' from Avi means: trust the order sent
+    if content is not None:
+        first_q = clean_text((read or {}).get("question_written") or "")
+        for gi, g in enumerate(content):
+            q = g["question_written"] or (first_q if gi == 0 and len(content) == 1 else "")
+            g["read"] = None
+            if q:
+                g["read"] = {"question_written": q, "question_guess": q,
+                             "answer_summary": (read or {}).get("answer_summary", "") if gi == 0 else "",
+                             "page_order": list(range(1, len(g["photos"]) + 1)), "legible": True,
+                             "photo_texts": [texts_by.get(k, "") for k in g["photos"]]}
+            elif len(content) == 1 and (read or {}).get("question_guess"):
+                g["read"] = {"question_written": "", "question_guess": read["question_guess"],
+                             "answer_summary": read.get("answer_summary", ""),
+                             "page_order": list(range(1, len(g["photos"]) + 1)), "legible": True,
+                             "photo_texts": [texts_by.get(k, "") for k in g["photos"]]}
+        return content
     info = {}
     for e in (read or {}).get("photos") or []:
         try:
@@ -319,9 +416,11 @@ def group_photos(read, n, hard_breaks=()):
         photos = list(range(a, b))
         qtop = clean_text(((info.get(a) or {}).get("question_at_top") or "").strip())
         groups.append({"photos": photos, "question_written": qtop, "read": None})
+    texts = {k: (e.get("text") or "") for k, e in info.items()}
     if len(groups) == 1:
         one = dict(read or {})
         one["page_order"] = repair_order(one.get("page_order"), n)
+        one["photo_texts"] = [texts.get(k, "") for k in range(1, n + 1)]
         groups[0]["read"] = one if (one.get("question_written") or one.get("question_guess")) else None
         groups[0]["question_written"] = one.get("question_written") or groups[0]["question_written"]
         return groups
@@ -333,8 +432,27 @@ def group_photos(read, n, hard_breaks=()):
         if q:
             summary = (read or {}).get("answer_summary", "") if g["photos"][0] == 1 else ""
             g["read"] = {"question_written": q, "question_guess": q, "answer_summary": summary,
-                         "page_order": list(range(1, len(g["photos"]) + 1)), "legible": True}
+                         "page_order": list(range(1, len(g["photos"]) + 1)), "legible": True,
+                         "photo_texts": [texts.get(k, "") for k in g["photos"]]}
     return groups
+
+
+def photo_texts(read, n):
+    """The transcription of each of the n photos (in the order sent), from a read_answer reply or a group's read.
+    Empty strings when Gemini gave none (transcription off, or an old reply)."""
+    read = read or {}
+    got = read.get("photo_texts")
+    if isinstance(got, list) and len(got) == n:
+        return [t if isinstance(t, str) else "" for t in got]
+    out = [""] * n
+    for e in read.get("photos") or []:
+        try:
+            k = int(e.get("photo"))
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if 1 <= k <= n and not out[k - 1] and isinstance(e.get("text"), str):
+            out[k - 1] = e["text"]
+    return out
 
 
 class GeminiClient:
@@ -512,18 +630,24 @@ class GeminiClient:
             parts.append({"inline_data": {"mime_type": "image/jpeg", "data": base64.b64encode(data).decode("ascii")}})
         return parts
 
-    def read_answer(self, paths):
+    def read_answer(self, paths, transcribe=False, side=READ_SIDE):
+        """ONE request: splits a batch, reads the question and (transcribe=True) copies the handwriting of every
+        photo, so no second Gemini call is ever needed for the answer text. Photos go as small copies (side)."""
         n = len(paths)
+        transcribe = bool(transcribe) and n <= TRANSCRIBE_MAX_PHOTOS
 
         def check(d):
             if not isinstance(d.get("question_written", ""), str):
                 raise ValueError("question_written missing")
 
-        parts = self.image_parts(paths, side=READ_SIDE if n > 3 else None) + [{"text": (
-            f"There are {n} photos, in the order they were sent. For every photo say whether a new question starts "
-            "at its top. Then give the reading order as photo numbers, the first question if written, otherwise "
-            "your best description of it, and a short summary of the first answer.")}]
-        data = self.generate_json(READ_SYSTEM, parts, READ_SCHEMA, check, what="Reading the photos")
+        ask = (f"There are {n} photos, in the order they were sent. For every photo say whether a new question starts "
+               "at its top. Then give the reading order as photo numbers, the first question if written, otherwise "
+               "your best description of it, and a short summary of the first answer.")
+        if transcribe:
+            ask += " Transcribe the handwriting of every photo in its 'text' field."
+        parts = self.image_parts(paths, side=int(side) if side else None) + [{"text": ask}]
+        data = self.generate_json(READ_SYSTEM + (READ_TRANSCRIBE if transcribe else ""), parts,
+                                  read_schema(transcribe), check, what="Reading the photos")
         data["page_order"] = repair_order(data.get("page_order"), n)
         return data
 
