@@ -7,6 +7,10 @@ shuffled pages), put the pages in reading order, find each question and copy the
 from Notion with any AI (Grok, Gemini, ChatGPT can use the saved answer text). To have Gemini evaluate and write
 marks and remarks again, set `EVALUATE` to `on` on Render (or `"evaluate": true` in config.json).
 
+Switch from Telegram, no Render change needed: `/evaluate` (attach and evaluate) or `/attach` (also `/upload`,
+attach only) lasts until you change it or the free server restarts, then EVALUATE decides again. For one set only,
+send the word `evaluate` or `attach` just before the photos, or as the photo caption. `/status` shows the mode.
+
 Everything it uses is free: Telegram, Notion, Gemini (Google AI Studio) and Render.
 
 ## Get your own copy (about 15 minutes)

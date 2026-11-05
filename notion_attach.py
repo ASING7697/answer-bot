@@ -1187,7 +1187,7 @@ class Context:
         self.evaluate = bool(cfg.get("evaluate", False)) and not args.no_eval
         # Gemini READS the photos (split, match, transcribe) even when it does not evaluate. --no-eval means no
         # Gemini at all (photo-only, needs the question link).
-        self.read_with_gemini = not args.no_eval and (self.evaluate or bool(cfg.get("gemini_read", True)))
+        self.read_with_gemini = not args.no_eval and bool(cfg.get("gemini_read", True))
         self.client = client
         self.gem = gem
         self.http = None  # session used to download photos back from Notion (tests put a fake here)
@@ -1266,15 +1266,16 @@ class Context:
 
     def uses_gemini(self):
         """True when Gemini reads the photos: always in evaluate mode; in upload-only mode when a key is set."""
-        if not self.read_with_gemini:
+        if not (self.read_with_gemini or (self.evaluate and not self.args.no_eval)):
             return False
         return self.evaluate or self.gem is not None or gemini_key_ok(self.cfg.get("gemini_api_key", ""))
 
-    def columns(self, tracker="geo"):
-        if tracker not in self._columns:
-            self._columns[tracker] = ensure_gemini_columns(self.notion(), self.cfg, self.log, tracker,
-                                                           gemini=self.evaluate)
-        return self._columns[tracker]
+    def columns(self, tracker="geo", gemini=None):
+        gemini = bool(self.evaluate if gemini is None else gemini)
+        key = (tracker, gemini)  # the mode can change from Telegram (/evaluate, /attach)
+        if key not in self._columns:
+            self._columns[key] = ensure_gemini_columns(self.notion(), self.cfg, self.log, tracker, gemini=gemini)
+        return self._columns[key]
 
 
 class GeminiBusy(Exception):
@@ -1644,7 +1645,7 @@ def find_pending(ctx):
     out = []
     for key in ctx.trackers():
         try:
-            if rk not in ctx.columns(key):
+            if rk not in ctx.columns(key, gemini=True):
                 continue
             ds = tracker_ds(client, ctx.cfg, key)
             cursor = None
@@ -1745,7 +1746,7 @@ def evaluate_pending(ctx, q):
         q["label"] = "GS PYQs" + (f", {q['paper']}" if q.get("paper") else "")
     out_of, eval_wl = marking(q)
     rk, mk = cfg.get("gemini_remark_property", "Gemini Remark"), cfg.get("gemini_marks_property", "Gemini Marks")
-    columns = ctx.columns(tracker)
+    columns = ctx.columns(tracker, gemini=True)  # always an evaluation here, whatever the current mode
     blocks = client.list_children(page_id)
     pending_id, photos = pending_photos(blocks)
     page_url = f"https://www.notion.so/{plain_id(page_id)}"

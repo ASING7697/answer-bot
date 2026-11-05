@@ -161,6 +161,36 @@ class State:
         data = {k: v for k, v in meta.items() if k != "_dir"}
         (d / "meta.json").write_text(json.dumps(data, indent=1), encoding="utf-8")
 
+    # ---- mode (attach-only or attach + evaluate), switched from Telegram. Kept on disk next to the sets, so it
+    # lasts until the server restarts (Render's free disk is wiped then; EVALUATE decides again).
+    def mode(self):
+        """'attach', 'evaluate' or None (not switched: use EVALUATE / config.json)."""
+        try:
+            m = json.loads((self.root / "mode.json").read_text()).get("mode")
+        except Exception:
+            return None
+        return m if m in ("attach", "evaluate") else None
+
+    def save_mode(self, mode):
+        f = self.root / "mode.json"
+        tmp = f.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"mode": mode}))
+        os.replace(tmp, f)
+
+    def one_shot(self, chat_id, take=False):
+        """Mode for the NEXT set only ('evaluate' or 'attach' sent as plain text before the photos)."""
+        f = self.root / f"next_mode_{chat_id}.json"
+        try:
+            m = json.loads(f.read_text()).get("mode")
+        except Exception:
+            return None
+        if take:
+            f.unlink(missing_ok=True)
+        return m
+
+    def save_one_shot(self, chat_id, mode):
+        (self.root / f"next_mode_{chat_id}.json").write_text(json.dumps({"mode": mode}))
+
     def new_set(self, chat_id, msg_date):
         sid = time.strftime("%Y%m%d_%H%M%S", time.localtime(msg_date)) + f"_{len(list(self.sets_dir.iterdir()))}"
         d = self.sets_dir / sid
@@ -176,12 +206,19 @@ class State:
 
 HELP = ("Commands: /status checks every key and shows the last run; /test is a dry run that writes nothing; "
         "/retry evaluates answers that are still waiting because Gemini was busy; /myid shows your Telegram ID.\n"
+        "Mode: /attach (or /upload) attaches only, using Gemini just once per batch to read it; /evaluate attaches "
+        "and has Gemini evaluate. Both last until you change them (or the server restarts). For one set only, send "
+        "the word evaluate or attach just before the photos, or as the photo caption.\n"
         "Send me the photos of one answer (as photos or, for best quality, as files). "
         "Send 'done' to finish a set straight away. "
         "You can send several answers in one go, in any mix: I split them by page content (a new question written "
         "at the top of a page starts a new answer), never by time. To force a split, send 'next' between two answers. "
         "I find each question, attach its pages under My answer, save the answer text, and set Status Done and "
-        "Evaluated 'Not evaluated'. I do not evaluate (upload-only), so another AI can evaluate from Notion later.")
+        "Evaluated 'Not evaluated'. In attach-only mode another AI can evaluate from Notion later.")
+
+
+ONE_SHOT_WORDS = {"evaluate": "evaluate", "eval": "evaluate", "attach": "attach", "upload": "attach",
+                  "attach only": "attach", "upload only": "attach"}
 
 
 def best_file(msg):
@@ -311,6 +348,28 @@ class Listener:
         self.bot = bot
         self.state = state or State(na.SCRIPT_DIR / "telegram_state")
         self.retrier = Retrier(self)
+        self.default_evaluate = bool(ctx.evaluate)  # EVALUATE / config.json, used after a restart
+        self.apply_mode()
+
+    # ---- mode
+    def mode(self):
+        m = self.state.mode()
+        if m is None:
+            m = "evaluate" if self.default_evaluate else "attach"
+        return m
+
+    def apply_mode(self, mode=None):
+        """Sets ctx.evaluate for the next work. --no-eval (no Gemini at all) always wins."""
+        mode = mode or self.mode()
+        self.ctx.evaluate = mode == "evaluate" and not getattr(self.ctx.args, "no_eval", False)
+        return self.ctx.evaluate
+
+    def mode_text(self):
+        m = self.mode()
+        how = ("you switched it" if self.state.mode() else
+               "the default from EVALUATE" if os.environ.get("EVALUATE") else "the default")
+        return ("Mode: attach + evaluate (Gemini evaluates every answer)" if m == "evaluate" else
+                "Mode: attach-only (Gemini only reads each batch once)") + f", {how}."
 
     def after_updates(self, updates):
         """After handling messages from Avi, quietly try the answers still waiting for Gemini (in the background)."""
@@ -348,6 +407,15 @@ class Listener:
             return
         chat_id = msg["chat"]["id"]
         date = float(msg.get("date") or self.now())
+        if said in ("/attach", "/upload", "/attachonly", "/attach_only", "/evaluate", "/eval"):
+            mode = "evaluate" if said in ("/evaluate", "/eval") else "attach"
+            self.state.save_mode(mode)
+            self.apply_mode(mode)
+            self.bot.send(chat_id, ("Mode set: attach + evaluate. Gemini will evaluate this and later sets, until "
+                                    "you send /attach." if mode == "evaluate" else
+                                    "Mode set: attach-only. I will attach this and later sets without evaluating, "
+                                    "until you send /evaluate.") + " (A server restart goes back to the default.)")
+            return
         f = best_file(msg)
         if f:
             file_id, ext, unique_id = f
@@ -357,6 +425,12 @@ class Listener:
             cur = self.open_set(chat_id)
             if cur is None:
                 cur = self.state.new_set(chat_id, date)
+                shot = self.state.one_shot(chat_id, take=True)
+                if shot:
+                    cur["mode"] = shot
+            cap = (msg.get("caption") or "").strip().lower()
+            if cap in ONE_SHOT_WORDS:
+                cur["mode"] = ONE_SHOT_WORDS[cap]
             cur["count"] += 1
             dest = cur["_dir"] / f"page_{cur['count']:03d}{ext}"
             self.bot.download(file_id, dest)
@@ -397,6 +471,18 @@ class Listener:
                                    "server restarted and lost those photos: please send the photos again.")
             return
         cur = self.open_set(chat_id)
+        if low in ONE_SHOT_WORDS:
+            shot = ONE_SHOT_WORDS[low]
+            if cur:
+                cur["mode"] = shot
+                self.state.save(cur)
+                where = "this set"
+            else:
+                self.state.save_one_shot(chat_id, shot)
+                where = "the next set you send"
+            self.bot.send(chat_id, f"OK, {where} will be " + ("attached and evaluated." if shot == "evaluate" else
+                                   "attached only (no evaluation).") + " Later sets use the normal mode.")
+            return
         if low in ("done", "/done", "finish", "end") and cur:
             cur["status"] = "ready"
             self.state.save(cur)
@@ -473,6 +559,14 @@ class Listener:
         return out
 
     def process(self, meta):
+        """One set, in its own mode (a one-shot word) or the current mode."""
+        self.apply_mode(meta.get("mode"))
+        try:
+            return self._process(meta)
+        finally:
+            self.apply_mode()
+
+    def _process(self, meta):
         chat = meta["chat_id"]
         d = meta["_dir"]
         photos = na.list_photos(d, "name")
@@ -486,7 +580,8 @@ class Listener:
             shutil.rmtree(d, ignore_errors=True)
             return
         if not meta.get("announced"):
-            self.bot.send(chat, f"Got {len(photos)} page{'s' if len(photos) != 1 else ''}, working...")
+            self.bot.send(chat, f"Got {len(photos)} page{'s' if len(photos) != 1 else ''}, working"
+                          + (" (attach + evaluate)..." if self.ctx.evaluate else "..."))
             meta["announced"] = True
             self.state.save(meta)
         uids = meta.get("unique_ids") or {}
@@ -674,7 +769,7 @@ class Listener:
         return lines
 
     def status_report(self):
-        lines = ["Status report"] + self.checks()
+        lines = ["Status report", self.mode_text()] + self.checks()
         waiting = [m for m in self.state.sets()]
         lines.append(f"Answer sets waiting: {len(waiting)}")
         for m in waiting:
